@@ -1,0 +1,17 @@
+# 说明：已在 langgraph 1.2.11 / langchain-core 1.6.0 / langchain-openai 1.6.0
+# （Python 3.14.6）实测验证通过。langchain 主包与 langchain-community 在代码中
+# 未被引用（仅用 langchain_core 与 langchain_openai），已从依赖中移除。
+# 部署前建议安装完成后执行: pip freeze > requirements.lock
+langgraph>=1.0
+langchain-core>=1.0
+langchain-openai>=1.0
+playwright>=1.40
+dashscope>=1.14
+openai>=1.0
+apscheduler>=3.10
+markdown>=3.5
+beautifulsoup4>=4.12
+pyyaml>=6.0
+pycryptodome>=3.19  # 飞书事件订阅加密（encrypt_key）解密
+Pillow>=10.0
+requests>=2.28

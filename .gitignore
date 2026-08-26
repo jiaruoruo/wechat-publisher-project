@@ -1,0 +1,13 @@
+# ── 临时 / 缓存 / 浏览器产物 ──────────────────────────────
+.piptmp/
+.testtmp/
+.pw-browsers/
+.qoder/
+
+# ── 运行残留的临时目录与缓存 ──────────────────────────────
+wechat-publisher/tmp*/
+wechat-publisher/pytest-cache-files-*/
+wechat-publisher/.freebuff/
+__pycache__/
+*.py[cod]
+.pytest_cache/

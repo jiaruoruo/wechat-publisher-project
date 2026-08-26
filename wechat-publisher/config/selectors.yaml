@@ -1,0 +1,131 @@
+# 公众号编辑器选择器清单 — 集中配置，编辑器改版时只需改此文件
+#
+# 每个分组对应一类交互（如标题输入、保存草稿），取值：
+#   - 列表：多选择器按顺序回退（首个可见即用）
+#   - 字符串：单一选择器
+#
+# 加载优先级（后者覆盖前者）：
+#   1. browser/wechat_selectors.py 内置默认值（本文件缺失/损坏时的兜底）
+#   2. 本文件 config/selectors.yaml
+#   3. settings.yaml 的 wechat.selectors_file 指向的自定义文件
+#   4. 环境变量 WECHAT_SELECTORS_FILE 指向的自定义文件（优先级最高）
+#
+# 长驻进程（Hermes）编辑本文件后无需重启：调用
+#   from browser import wechat_selectors
+#   wechat_selectors.reload_selectors()
+# 即可热加载。
+
+# ── 导航 ──────────────────────────────────────────────────────────────
+# 新建图文入口（新版后台：侧边栏或首页的 new-creation 菜单）
+nav_new_article:
+  - ".new-creation__menu-title:has-text(\"文章\")"
+  - ".new-creation__menu-item:has-text(\"文章\")"
+  - ".new-creation__menu"
+  - 'a:has-text("新的创作")'
+  - 'a:has-text("图文消息")'
+  - ".new-creation-accordion"
+  - ".weui-desktop-btn_wrp .weui-desktop-btn"
+  - 'a[href*="appmsg"]'
+
+# 编辑器加载等待
+nav_editor_load: "#title, .edui-body-container, [contenteditable='true'], .js_editor_container, #ueditor_0"
+
+# ── 标题 ──────────────────────────────────────────────────────────────
+# 新版编辑器：标题是第一个 ProseMirror（最小高度）；#title 为隐藏字段
+title_inputs:
+  - ".ProseMirror:nth-of-type(1)"
+  - ".title_input_area .ProseMirror"
+  - "#title"
+  - 'input[placeholder*="标题"]'
+  - 'textarea[placeholder*="标题"]'
+  - ".title_editor .weui-desktop-form__input input"
+  - 'input[name="title"]'
+
+# ── 正文编辑器（剪贴板粘贴方式） ─────────────────────────────────────
+content_editors:
+  - ".edui-body-container"
+  - "#ueditor_0"
+  - ".ProseMirror"
+  - '[contenteditable="true"]'
+
+# 内容注入验证
+content_verify_editor: '[contenteditable="true"], .edui-body-container, .ProseMirror'
+
+# ── 封面区域 ──────────────────────────────────────────────────────────
+# 点击封面区域，展开设置面板
+cover_area:
+  - ".js_cover_area"
+  - ".cover_area"
+  - ".cover-panel"
+  - ".js_cover"
+  - ".cover-upload-area"
+  - 'a[class*="cover"]'
+  - "text=封面"
+
+# 「从正文选择」入口（多轮选择器回退，兼容文案/结构改版）
+cover_select_from_body:
+  - "text=从正文选择"
+  - 'button:has-text("从正文选择")'
+  - 'a:has-text("从正文选择")'
+  - 'li:has-text("从正文选择")'
+  - 'label:has-text("从正文选择")'
+  - "text=从正文中选择"
+  - 'div:has-text("从正文")'
+  - '[class*="choose"]:has-text("正文")'
+  - "text=正文"  # 最后兜底
+
+# 子面板：正文首图点选
+cover_body_first_image:
+  - ".cover-body-img"
+  - ".js_cover_from_body img"
+  - '[class*="from-body"] img'
+  - '[class*="from_body"] img'
+  - ".weui-desktop-radio-group img"
+
+# 封面预览元素（成功信号）
+cover_preview: ".cover_preview, .js_cover_preview"
+
+# ── 封面上传（文件上传方式） ──────────────────────────────────────────
+cover_file_inputs:
+  - 'input[type="file"][accept*="image"]'
+  - '.cover-upload input[type="file"]'
+  - '.weui-desktop-form__upload input[type="file"]'
+
+cover_upload_btn: 'text="上传"'
+
+# ── 摘要 ──────────────────────────────────────────────────────────────
+summary_inputs:
+  - "#js_description"
+  - 'textarea[placeholder*="摘要"]'
+  - 'textarea[name="digest"]'
+  - ".weui-desktop-form__textarea"
+
+# ── 保存草稿 ──────────────────────────────────────────────────────────
+# 注意：新版编辑器中 #js_send 是「发表」按钮（群发），不是保存草稿！
+# 保存草稿按钮文本为「保存为草稿」。
+draft_buttons:
+  - 'span:has-text("保存为草稿")'
+  - 'button:has-text("保存为草稿")'
+  - 'a:has-text("保存为草稿")'
+  - 'span:has-text("保存草稿")'
+  - 'button:has-text("保存草稿")'
+  - '.btn:has-text("保存为草稿")'
+  - '#js_send'  # 仅作最后兜底（旧版编辑器）
+
+# ── 发布（群发） ──────────────────────────────────────────────────────
+# 新版编辑器：发表按钮文本为「发表」（#js_send），点击后出现确认对话框
+publish_buttons:
+  - 'span:has-text("发表")'
+  - 'button:has-text("发表")'
+  - 'a:has-text("发表")'
+  - 'button:has-text("群发")'
+  - 'a:has-text("群发")'
+  - "#js_send"
+
+# ── 通用 ──────────────────────────────────────────────────────────────
+confirm_button: 'button:has-text("确定")'
+toast: ".weui-desktop-toast, .weui-toast"
+
+# 已登录后台的特征选择器（browser/wechat_session.py 的 check_login 用）
+login_indicators:
+  - ".weui-desktop-panel"
