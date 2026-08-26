@@ -20,7 +20,7 @@ python main.py check
 
 echo.
 echo [2/3] 检查登录状态...
-if not exist "%~dp0storagerowser_session.json" (
+if not exist "%~dp0storage\browser_session.json" (
     echo   未登录，请先运行: python main.py login
     echo   或使用: python main.py run --topic "你的选题"
     goto :end

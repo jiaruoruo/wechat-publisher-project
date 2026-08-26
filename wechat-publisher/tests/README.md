@@ -9,6 +9,11 @@ python -m unittest discover -s tests -v
 大部分用例是纯标准库（无需安装运行时依赖）；`test_e2e_workflow.py`
 需要 langgraph 等依赖，未安装时自动跳过（skip）。
 
+跳过行为可感知：依赖缺失时，模块导入阶段会在 stderr 打印 `WARNING:`
+开头的警告；用 pytest 运行时，结果摘要末尾还会输出独立的
+「WARNING: 端到端覆盖被跳过（依赖缺失）」分隔区块（由 `tests/conftest.py` 提供），
+明确告知哪些端到端用例未被执行。
+
 ## 覆盖范围
 
 | 模块 | 用例 | 说明 |

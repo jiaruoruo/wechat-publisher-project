@@ -14,7 +14,7 @@ python main.py check
 
 Write-Host ""
 Write-Host "[2/3] 检查登录..." -ForegroundColor Cyan
-$sessionFile = Join-Path $Root "storagerowser_session.json"
+$sessionFile = Join-Path $Root "storage/browser_session.json"
 if (-not (Test-Path $sessionFile)) {
     Write-Host "  未登录！请先运行: python main.py login" -ForegroundColor Yellow
     exit 1

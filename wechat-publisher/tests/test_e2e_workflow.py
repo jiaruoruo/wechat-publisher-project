@@ -23,6 +23,14 @@ try:
 except ImportError:
     DEPS_AVAILABLE = False
 
+if not DEPS_AVAILABLE:
+    # 跳过行为可感知：无论 unittest discover 还是 pytest 运行，
+    # 均在结果输出中给出明确可见的警告（详见 tests/README.md）
+    print(
+        "WARNING: langgraph 等运行时依赖未安装，test_e2e_workflow.py 的全部端到端用例将被跳过（skip）",
+        file=sys.stderr,
+    )
+
 if DEPS_AVAILABLE:
     import models.llm_router as lr_mod
     import models.image_model as im_mod
