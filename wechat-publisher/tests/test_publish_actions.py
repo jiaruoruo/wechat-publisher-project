@@ -7,6 +7,7 @@
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -42,14 +43,19 @@ class TestCoverCdnPure(unittest.TestCase):
 
     def test_upload_cover_to_cdn_missing_file(self):
         missing = os.path.join(tempfile.mkdtemp(), "no_such_cover.png")
+        self.addCleanup(shutil.rmtree, os.path.dirname(missing), True)
         self.assertEqual(self.pa.upload_cover_to_cdn(missing), "")
 
 
 def _make_pa(wechat_cfg: dict):
-    """构造一个所有 page 交互都被 mock 掉的 PublishActions（只测分支逻辑）"""
+    """构造一个所有 page 交互都被 mock 掉的 PublishActions（只测分支逻辑）
+
+    返回 (pa, tmpdir)：调用方负责注册 shutil.rmtree 清理，避免临时目录泄漏。
+    """
+    tmpdir = tempfile.mkdtemp()
     pa = PublishActions(
         None,
-        {"wechat": wechat_cfg, "browser": {"screenshot_dir": tempfile.mkdtemp()}},
+        {"wechat": wechat_cfg, "browser": {"screenshot_dir": tmpdir}},
     )
     pa.navigate_to_editor = mock.Mock()
     pa.upload_cover_to_cdn = mock.Mock(return_value="https://mmbiz.qpic.cn/cover")
@@ -65,7 +71,7 @@ def _make_pa(wechat_cfg: dict):
     pa.preview_before_publish = mock.Mock(return_value="")
     pa.save_draft = mock.Mock(return_value=True)
     pa.publish = mock.Mock(return_value=True)
-    return pa
+    return pa, tmpdir
 
 
 @unittest.skipUnless(PA_AVAILABLE, "需要 playwright 等运行时依赖")
@@ -73,7 +79,8 @@ class TestExecutePublishCoverInBody(unittest.TestCase):
     """cover_in_body 配置对 execute_publish 封面流程的分支影响"""
 
     def _run(self, wechat_cfg: dict, cover_path: str = "cover.png"):
-        pa = _make_pa(wechat_cfg)
+        pa, tmpdir = _make_pa(wechat_cfg)
+        self.addCleanup(shutil.rmtree, tmpdir, True)
         res = pa.execute_publish("标题", "<p>正文</p>", cover_path, "摘要", ["a.png"])
         return pa, res
 
@@ -88,7 +95,8 @@ class TestExecutePublishCoverInBody(unittest.TestCase):
         pa.upload_cover_image.assert_not_called()
 
     def test_true_falls_back_to_file_upload(self):
-        pa = _make_pa({"external_images": True, "cover_in_body": True})
+        pa, tmpdir = _make_pa({"external_images": True, "cover_in_body": True})
+        self.addCleanup(shutil.rmtree, tmpdir, True)
         pa.set_cover_from_body = mock.Mock(return_value=False)
         res = pa.execute_publish("标题", "<p>正文</p>", "cover.png", "摘要", ["a.png"])
         self.assertTrue(res["success"])
@@ -137,7 +145,7 @@ class _FakeLocator:
     def is_visible(self, timeout=0):
         return self.page._visible(self.selector)
 
-    def click(self):
+    def click(self, timeout=None, force=False):
         if not self.page._visible(self.selector):
             raise Exception(f"{self.selector} 不可见")
         self.page._clicked.append(self.selector)
@@ -158,9 +166,13 @@ class _FakeLocator:
 
 
 class _FakePage:
-    """极简 Page 桩：visible 为 selector->bool 的映射；preview 控制封面预览是否出现"""
+    """极简 Page 桩：visible 为 selector->bool 的映射；preview 控制封面预览是否出现；
+    evaluate_result 控制 evaluate 的返回值；url 可被测试改写以模拟发布后跳转"""
 
-    def __init__(self, visible: dict, preview: bool = True):
+    # 与 config/selectors.yaml 的 confirm_button 保持一致（兼容「确定/确认」）
+    CONFIRM_SEL = 'button:has-text("确定"), button:has-text("确认")'
+
+    def __init__(self, visible: dict, preview: bool = True, evaluate_result=True):
         self._visible_map = visible
         self._clicked = []
         self._filled = {}
@@ -168,6 +180,10 @@ class _FakePage:
         self.preview = preview
         self.screenshots = []
         self.evaluations = []
+        self.evaluate_result = evaluate_result
+        # 默认停留在编辑器页（URL 含 appmsg_edit，未发生发布后跳转）
+        self.url = "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit_v2&action=edit&isNew=1"
+        self.goto_history = []
 
     def _visible(self, selector):
         return self._visible_map.get(selector, False)
@@ -175,7 +191,13 @@ class _FakePage:
     def locator(self, selector):
         return _FakeLocator(self, selector)
 
+    def goto(self, url, **kwargs):
+        self.goto_history.append(url)
+        self.url = url
+
     def wait_for_selector(self, selector, timeout=0):
+        if "toast" in selector.lower():
+            return  # 保存草稿/发布的 toast 等待：失败路径会安静超时，不影响判定
         if not self.preview:
             raise Exception("封面预览未出现")
 
@@ -188,7 +210,7 @@ class _FakePage:
 
     def evaluate(self, js):
         self.evaluations.append(js)
-        return True
+        return self.evaluate_result
 
     def screenshot(self, path=None):
         self.screenshots.append(path)
@@ -203,7 +225,9 @@ class TestSetCoverFromBody(unittest.TestCase):
     """set_cover_from_body 的多轮选择器回退与失败诊断"""
 
     def _run(self, page):
-        pa = PublishActions(page, {"browser": {"screenshot_dir": tempfile.mkdtemp()}})
+        tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        pa = PublishActions(page, {"browser": {"screenshot_dir": tmpdir}})
         return pa.set_cover_from_body(), page
 
     def test_primary_selector_path(self):
@@ -263,6 +287,7 @@ class TestTrySelectInfrastructure(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
 
     def _make(self, page):
         return PublishActions(page, {"browser": {"screenshot_dir": self.tmpdir}})
@@ -442,21 +467,226 @@ class TestTrySelectInfrastructure(unittest.TestCase):
     # ── publish 集成 ────────────────────────────────────────────────
 
     def test_publish_clicks_and_returns_true(self):
+        # publish() 现在要求：确认对话框 + 真实成功信号才返回 True；
+        # 新版对话框确认按钮文本是「发表」（v2 跳转旧版后自动弹出）
         page = _FakePage({'button:has-text("群发")': True})
         pa = self._make(page)
-        ok = pa.publish()
+        pa._wait_publish_confirm_dialog = mock.Mock(return_value=True)
+        pa._wait_publish_outcome = mock.Mock(return_value=(True, "页面出现成功提示「发表成功」"))
+        ok = pa.publish(title="测试")
         self.assertTrue(ok)
         self.assertIn('button:has-text("群发")', page._clicked)
+        pa._wait_publish_confirm_dialog.assert_called_once()
 
     def test_publish_returns_false_on_miss(self):
         page = _FakePage({})
         pa = self._make(page)
+        pa._wait_publish_confirm_dialog = mock.Mock(return_value=False)
         ok = pa.publish()
         self.assertFalse(ok)
         self.assertTrue(
             any("publish_failed" in p for p in page.screenshots),
             page.screenshots,
         )
+
+
+# ── 发布结果验证（防假阳性）测试 ────────────────────────────────
+
+
+@unittest.skipUnless(PA_AVAILABLE, "需要 playwright 等运行时依赖")
+class TestPublishVerification(unittest.TestCase):
+    """publish() 假阳性回归、_wait_publish_outcome 信号判定、
+    verify_published_online 发表记录复核、execute_publish publish 模式复核集成"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
+
+    def _make(self, page, wechat=None):
+        return PublishActions(
+            page,
+            {"wechat": wechat or {}, "browser": {"screenshot_dir": self.tmpdir}},
+        )
+
+    # ── publish() 假阳性回归 ──────────────────────────────────────────
+
+    def test_publish_no_dialog_never_reports_success(self):
+        """历史假阳性回归：确认对话框未出现时绝不能报发布成功"""
+        page = _FakePage({'button:has-text("发表")': True})  # 确认对话框始终不出现
+        pa = self._make(page)
+        pa._wait_publish_confirm_dialog = mock.Mock(return_value=False)
+        pa._wait_publish_outcome = mock.Mock()
+        ok = pa.publish(title="测试")
+        self.assertFalse(ok)
+        pa._wait_publish_outcome.assert_not_called()
+        self.assertTrue(
+            any("publish_no_dialog" in p for p in page.screenshots),
+            page.screenshots,
+        )
+
+    def test_publish_dialog_confirmed_but_no_success_signal(self):
+        page = _FakePage({'button:has-text("发表")': True})
+        pa = self._make(page)
+        pa._wait_publish_confirm_dialog = mock.Mock(return_value=True)
+        pa._wait_publish_outcome = mock.Mock(return_value=(False, "超时无信号"))
+        ok = pa.publish(title="测试")
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("publish_no_success_signal" in p for p in page.screenshots),
+            page.screenshots,
+        )
+
+    def test_publish_success_requires_dialog_and_signal(self):
+        page = _FakePage({'button:has-text("发表")': True})
+        pa = self._make(page)
+        pa._wait_publish_confirm_dialog = mock.Mock(return_value=True)
+        pa._wait_publish_outcome = mock.Mock(return_value=(True, "页面已跳转"))
+        ok = pa.publish(title="测试")
+        self.assertTrue(ok)
+        pa._wait_publish_confirm_dialog.assert_called_once()
+
+    # ── _wait_publish_outcome 信号判定 ────────────────────────────────
+
+    def test_outcome_url_navigation_is_success(self):
+        page = _FakePage({})
+        page.url = "https://mp.weixin.qq.com/cgi-bin/home?t=home"  # 已离开编辑器
+        pa = self._make(page)
+        ok, ev = pa._wait_publish_outcome(
+            "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_edit_v2",
+            timeout_ms=2000,
+        )
+        self.assertTrue(ok)
+        self.assertIn("页面已跳转", ev)
+
+    def test_outcome_still_in_editor_is_failure(self):
+        page = _FakePage({}, evaluate_result="")
+        pa = self._make(page)
+        ok, ev = pa._wait_publish_outcome(page.url, timeout_ms=300)
+        self.assertFalse(ok)
+        self.assertIn("无成功信号", ev)
+
+    def test_outcome_fail_text_is_failure(self):
+        page = _FakePage({}, evaluate_result="FAIL:不能为空")
+        pa = self._make(page)
+        ok, ev = pa._wait_publish_outcome(page.url, timeout_ms=2000)
+        self.assertFalse(ok)
+        self.assertIn("不能为空", ev)
+
+    def test_outcome_success_text_is_success(self):
+        page = _FakePage({}, evaluate_result="OK:发表成功")
+        pa = self._make(page)
+        ok, _ = pa._wait_publish_outcome(page.url, timeout_ms=2000)
+        self.assertTrue(ok)
+
+    # ── verify_published_online 发表记录复核 ──────────────────────────
+
+    def test_verify_found_in_published_list(self):
+        page = _FakePage({}, evaluate_result=True)
+        pa = self._make(page)
+        ok = pa.verify_published_online("智能体操作系统（AgentOS/AOS）详解｜AI的下一个战场")
+        self.assertTrue(ok)
+        self.assertTrue(page.goto_history, "复核必须真实导航到发表记录页")
+
+    def test_verify_not_found_returns_false(self):
+        page = _FakePage({}, evaluate_result=False)
+        pa = self._make(page)
+        ok = pa.verify_published_online("不存在的文章标题")
+        self.assertFalse(ok)
+        self.assertTrue(
+            any("verify_published_not_found" in p for p in page.screenshots),
+            page.screenshots,
+        )
+
+    def test_verify_empty_title_returns_false(self):
+        pa = self._make(_FakePage({}))
+        self.assertFalse(pa.verify_published_online(""))
+
+    def test_title_needle_strips_whitespace_and_truncates(self):
+        self.assertEqual(
+            PublishActions._title_needle("智能体操作系统（AgentOS/AOS）详解｜智能体操作系统：AI的下一个战场"),
+            "智能体操作系统（AgentOS/AOS）详解｜智能"[:20],
+        )
+
+    # ── execute_publish publish 模式复核集成 ──────────────────────────
+
+    def _make_execute_pa(self, page, wechat):
+        pa = PublishActions(
+            page,
+            {"wechat": wechat, "browser": {"screenshot_dir": self.tmpdir}},
+        )
+        pa.navigate_to_editor = mock.Mock()
+        pa.upload_cover_to_cdn = mock.Mock(return_value="https://mmbiz.qpic.cn/cover")
+        pa.fill_title = mock.Mock()
+        pa.replace_inline_images = mock.Mock(side_effect=lambda h, imgs: h)
+        pa.prepend_cover_image = mock.Mock(side_effect=lambda h, u: h)
+        pa.fill_content_html = mock.Mock()
+        pa.set_cover_from_body = mock.Mock(return_value=True)
+        pa.upload_cover_image = mock.Mock()
+        pa._wait_cover_preview = mock.Mock(return_value=True)
+        pa.fill_summary = mock.Mock()
+        pa.preview_before_publish = mock.Mock(return_value="")
+        pa.publish = mock.Mock(return_value=True)
+        pa.save_draft = mock.Mock(return_value=True)
+        pa.verify_published_online = mock.Mock(return_value=True)
+        return pa
+
+    def test_publish_success_and_verified(self):
+        pa = self._make_execute_pa(_FakePage({}), {"publish_mode": "publish"})
+        res = pa.execute_publish("标题", "<p>正文</p>", "cover.png", "摘要", ["a.png"])
+        self.assertTrue(res["success"])
+        self.assertEqual(res["mode"], "publish")
+        pa.verify_published_online.assert_called_once_with("标题")
+        pa.save_draft.assert_not_called()
+
+    def test_publish_true_but_verify_false_overturns(self):
+        """假阳性拦截：发布动作报成功，但发表记录复核找不到 → 必须判失败"""
+        pa = self._make_execute_pa(_FakePage({}), {"publish_mode": "publish"})
+        pa.verify_published_online = mock.Mock(return_value=False)
+        res = pa.execute_publish("标题", "<p>正文</p>", "cover.png", "摘要", ["a.png"])
+        self.assertFalse(res["success"])
+        self.assertIn("复核失败", res["error"])
+
+    def test_publish_false_but_verify_true_rescues(self):
+        """假阴性容忍：发布动作信号异常，但发表记录找到文章 → 改判成功"""
+        pa = self._make_execute_pa(_FakePage({}), {"publish_mode": "publish"})
+        pa.publish = mock.Mock(return_value=False)
+        res = pa.execute_publish("标题", "<p>正文</p>", "cover.png", "摘要", ["a.png"])
+        self.assertTrue(res["success"])
+        pa.save_draft.assert_called_once()  # 复核导航前先降级存草稿防丢失
+
+    def test_publish_false_and_verify_false_stays_failed(self):
+        pa = self._make_execute_pa(_FakePage({}), {"publish_mode": "publish"})
+        pa.publish = mock.Mock(return_value=False)
+        pa.verify_published_online = mock.Mock(return_value=False)
+        res = pa.execute_publish("标题", "<p>正文</p>", "cover.png", "摘要", ["a.png"])
+        self.assertFalse(res["success"])
+        pa.save_draft.assert_called_once()
+
+    def test_verify_disabled_by_config(self):
+        pa = self._make_execute_pa(
+            _FakePage({}), {"publish_mode": "publish", "verify_published": False}
+        )
+        res = pa.execute_publish("标题", "<p>正文</p>", "cover.png", "摘要", ["a.png"])
+        self.assertTrue(res["success"])
+        pa.verify_published_online.assert_not_called()
+
+    def test_publish_without_cover_downgrades_to_draft(self):
+        """无封面：发表必被后台拦截 → 降级存草稿防文章丢失，不尝试点击发表"""
+        pa = self._make_execute_pa(_FakePage({}), {"publish_mode": "publish"})
+        res = pa.execute_publish("标题", "<p>正文</p>", "", "摘要", ["a.png"])
+        self.assertTrue(res["success"])  # 草稿保存成功
+        self.assertEqual(res["mode"], "draft")
+        self.assertIn("封面", res["error"])
+        pa.publish.assert_not_called()
+        pa.save_draft.assert_called_once()
+
+    def test_publish_cover_check_failed_downgrades_to_draft(self):
+        """有封面文件但设置结果未验证到 → 同样降级存草稿"""
+        pa = self._make_execute_pa(_FakePage({}), {"publish_mode": "publish"})
+        pa._wait_cover_preview = mock.Mock(return_value=False)
+        res = pa.execute_publish("标题", "<p>正文</p>", "cover.png", "摘要", ["a.png"])
+        self.assertEqual(res["mode"], "draft")
+        pa.publish.assert_not_called()
 
 
 # ── 选择器命中率统计测试 ────────────────────────────────────────────
@@ -468,6 +698,7 @@ class TestSelectorStats(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmpdir, True)
 
     def _make(self, page):
         return PublishActions(page, {"browser": {"screenshot_dir": self.tmpdir}})
@@ -605,11 +836,14 @@ class TestSelectorStats(unittest.TestCase):
         m.assert_called_once_with(pa.screenshot_dir, pa.retention_days)
 
     def test_retention_days_config(self):
+        d1, d2 = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d1, True)
+        self.addCleanup(shutil.rmtree, d2, True)
         pa = PublishActions(None, {
-            "browser": {"screenshot_dir": tempfile.mkdtemp(), "screenshot_retention_days": 7},
+            "browser": {"screenshot_dir": d1, "screenshot_retention_days": 7},
         })
         self.assertEqual(pa.retention_days, 7)
-        pa2 = PublishActions(None, {"browser": {"screenshot_dir": tempfile.mkdtemp()}})
+        pa2 = PublishActions(None, {"browser": {"screenshot_dir": d2}})
         self.assertEqual(pa2.retention_days, 30)
 
     def test_execute_publish_preview_path_is_timestamped(self):

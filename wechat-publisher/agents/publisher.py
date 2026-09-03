@@ -95,11 +95,18 @@ class PublisherAgent(BaseAgent):
                     "mode": result["mode"],
                     "error": result.get("error", ""),
                     "published_at": datetime.now().isoformat(),
+                    # 发表后的文章链接（复核页提取，取不到为空串）
+                    "url": result.get("url", ""),
+                    # 最终注入编辑器的 HTML（占位符已解析为 CDN 外链、封面已注入），
+                    # 供落库实现「所见即所存」。用 getattr 兜底：测试替身/旧版
+                    # PublishActions 可能没有该属性，不应因此打断发布结果。
+                    "final_html": getattr(actions, "last_published_html", ""),
                 },
                 # metadata 走 schema 级归并，只需返回新增字段
                 "metadata": {
                     "published_at": datetime.now().isoformat(),
                     "publish_mode": result["mode"],
+                    "publish_url": result.get("url", ""),
                 },
             }
 

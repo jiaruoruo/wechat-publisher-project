@@ -21,6 +21,11 @@ class ContentWriterAgent(BaseAgent):
         self.content_config = config.get("content", {})
         self.min_words = self.content_config.get("article_length", {}).get("min", 1500)
         self.max_words = self.content_config.get("article_length", {}).get("max", 3000)
+        # 品牌风格（content.style）：与 topic_planner 共用同一配置来源，
+        # 使调性同时作用于「选题」与「正文」。
+        # 用 `or` 而非 dict.get 默认值：配置里写了空串时也要回落，
+        # 否则会把一个空的「内容风格要求」段落塞进 prompt。
+        self.style = self.content_config.get("style") or "专业但通俗易懂"
 
     def run(self, state: ArticleState) -> dict:
         """执行内容创作"""
@@ -85,6 +90,9 @@ class ContentWriterAgent(BaseAgent):
 {outline}
 - 目标受众：{target_audience}
 
+## 内容风格要求
+{self.style}
+
 ## 写作要求
 - 字数：{self.min_words}-{self.max_words} 字
 - 在需要配图的位置插入 [IMAGE: 图片描述] 标记
@@ -109,6 +117,9 @@ class ContentWriterAgent(BaseAgent):
 - 标题：{title}
 - 主题：{topic}
 - 目标受众：{target_audience}
+
+## 内容风格要求
+{self.style}
 
 ## 审核反馈
 {feedback}

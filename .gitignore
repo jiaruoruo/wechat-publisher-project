@@ -11,3 +11,7 @@ wechat-publisher/.freebuff/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# ── 项目数据与运行日志（禁止入库）──
+.codebuddy/
+probe-draft.log

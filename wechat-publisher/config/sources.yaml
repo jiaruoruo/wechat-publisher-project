@@ -1,0 +1,150 @@
+# 多源信息采集配置
+#
+# 设计要点（实测于 2026-09-02）：
+# - 搜索引擎（Bing）在「地理定位」下即使设 mkt=en-US 仍返回中文结果，
+#   无法稳定获取国际内容。因此国际内容必须靠「定向权威源」抓取。
+# - 失效源默认 disabled 并注明原因，避免每次请求浪费与报错。
+#
+# 字段说明：
+#   name     源名称（用于来源标注与审计）
+#   type     feed = RSS/Atom XML；json = GitHub/HN 类 JSON API
+#   url      抓取地址
+#   region   domestic(国内) / intl(国际)
+#   tier     authoritative(权威，单源即可信) / general(一般，需交叉印证)
+#   topics   关联主题：ai / robotics / chip（用于按关键词过滤）
+#   enabled  是否启用
+#   timeout  单次请求超时（秒）
+
+sources:
+  # ── 国际权威源（定向抓取）──
+  - name: "NVIDIA Blog"
+    type: feed
+    url: "https://blogs.nvidia.com/feed/"
+    region: intl
+    tier: authoritative
+    topics: [ai, robotics, chip]
+    enabled: true
+    timeout: 15
+  - name: "IEEE Spectrum AI"
+    type: feed
+    url: "https://spectrum.ieee.org/feeds/topic/artificial-intelligence.rss"
+    region: intl
+    tier: authoritative
+    topics: [ai, robotics, chip]
+    enabled: true
+    timeout: 15
+  - name: "Tom's Hardware"
+    type: feed
+    url: "https://www.tomshardware.com/feeds/all"
+    region: intl
+    tier: authoritative
+    topics: [chip, ai]
+    enabled: true
+    timeout: 15
+  - name: "MIT Technology Review"
+    type: feed
+    url: "https://www.technologyreview.com/feed/"
+    region: intl
+    tier: authoritative
+    topics: [ai, robotics, chip]
+    enabled: true
+    timeout: 15
+  - name: "Ars Technica"
+    type: feed
+    url: "https://feeds.arstechnica.com/arstechnica/technology-lab"
+    region: intl
+    tier: authoritative
+    topics: [ai, chip]
+    enabled: true
+    timeout: 15
+  - name: "arXiv"
+    type: feed
+    url: "http://export.arxiv.org/api/query?search_query=all:humanoid%20robot%20OR%20all:AI%20chip&start=0&max_results=8&sortBy=submittedDate&sortOrder=descending"
+    region: intl
+    tier: authoritative
+    topics: [ai, robotics, chip]
+    enabled: true
+    timeout: 20
+  - name: "GitHub Trending"
+    type: json
+    url: "https://api.github.com/search/repositories?q=AI+OR+robotics+OR+chip&sort=stars&order=desc&per_page=8"
+    region: intl
+    tier: authoritative
+    topics: [ai, robotics, chip]
+    enabled: true
+    timeout: 15
+  - name: "Hacker News"
+    type: json
+    url: "https://hn.algolia.com/api/v1/search_by_date?query=AI&tags=story&hitsPerPage=8"
+    region: intl
+    tier: general
+    topics: [ai, robotics, chip]
+    enabled: true
+    timeout: 15
+
+  # ── 国内源 ──
+  - name: "量子位"
+    type: feed
+    url: "https://www.qbitai.com/feed"
+    region: domestic
+    tier: general
+    topics: [ai, robotics, chip]
+    enabled: true
+    timeout: 15
+  # 以下源实测不可用，保留配置以便后续修复或网络环境变化后启用
+  - name: "机器之心"
+    type: feed
+    url: "https://www.jiqizhixin.com/rss"
+    region: domestic
+    tier: general
+    topics: [ai, robotics]
+    enabled: false
+    disabled_reason: "feed 返回 200 但条目解析为 0（结构变动），待修复"
+  - name: "36氪"
+    type: feed
+    url: "https://36kr.com/feed"
+    region: domestic
+    tier: general
+    topics: [ai, chip]
+    enabled: false
+    disabled_reason: "feed 返回 200 但条目解析为 0，待修复"
+  - name: "Intel Newsroom"
+    type: feed
+    url: "https://newsroom.intel.com/feed"
+    region: intl
+    tier: authoritative
+    topics: [chip]
+    enabled: false
+    disabled_reason: "官网 403 封禁"
+  - name: "AMD Newsroom"
+    type: feed
+    url: "https://www.amd.com/en/newsroom/rss.xml"
+    region: intl
+    tier: authoritative
+    topics: [chip]
+    enabled: false
+    disabled_reason: "官网 403 封禁"
+  - name: "TSMC Newsroom"
+    type: feed
+    url: "https://www.tsmc.com/static/english/news-events/newsroom/rss.xml"
+    region: intl
+    tier: authoritative
+    topics: [chip]
+    enabled: false
+    disabled_reason: "RSS 404 失效"
+  - name: "AnandTech"
+    type: feed
+    url: "https://www.anandtech.com/rss/"
+    region: intl
+    tier: authoritative
+    topics: [chip]
+    enabled: false
+    disabled_reason: "feed 0 条（站点已停运）"
+  - name: "The Verge AI"
+    type: feed
+    url: "https://www.theverge.com/rss/ai-artificial-intelligence/index.xml"
+    region: intl
+    tier: general
+    topics: [ai]
+    enabled: false
+    disabled_reason: "RSS 结构不匹配，条目解析为 0"

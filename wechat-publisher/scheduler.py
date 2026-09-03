@@ -27,13 +27,15 @@ def run_workflow():
     try:
         config = load_config()
 
-        # 发布前检查是否有待发布任务（短连接，用完即关）
+        # 发布前检查每日配额（短连接，用完即关）
+        # 只统计 status='published'：未发表的失败运行/草稿不应占用每日发布上限，
+        # 否则几次调试就会把当天配额耗光、导致定时任务被静默跳过。
         with ContentDB(config.get("storage", {}).get("db_path")) as db:
-            recent_count = db.get_article_count(days=1)
+            recent_count = db.get_article_count(days=1, status="published")
             max_daily = config.get("schedule", {}).get("max_daily_articles", 3)
             if recent_count >= max_daily:
                 logger.warning(
-                    f"今日已发布 {recent_count} 篇文章，"
+                    f"今日已发表 {recent_count} 篇文章，"
                     f"达到每日上限 {max_daily}，跳过本次发布"
                 )
                 return

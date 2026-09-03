@@ -25,6 +25,28 @@ except ImportError:
 
 WECHAT_MP_URL = "https://mp.weixin.qq.com"
 
+# 发表记录页候选入口（发布后复核用）。
+# 实测：后台内部页面必须拼 &token=...&lang=zh_CN（_mp_token 从当前 URL 提取），
+# 否则被重定向到首页/登录页；会话失效时复核会如实返回失败。
+PUBLISHED_LIST_URLS = (
+    "https://mp.weixin.qq.com/cgi-bin/appmsgpublish?sub=list&begin=0&count=50",
+    "https://mp.weixin.qq.com/cgi-bin/appmsg?t=media/appmsg_list&action=list&type=10",
+)
+
+# 发表记录页：按标题文本匹配文章链接（列表标题可能被截断，故双向包含匹配）
+_PUBLISHED_LINK_JS = """(args) => {
+    const norm = (s) => (s || '').replace(/\\s+/g, '');
+    const n = norm(args.needle);
+    if (!n) return '';
+    const as = Array.from(document.querySelectorAll('a[href]'));
+    for (const a of as) {
+        const t = norm(a.textContent || '');
+        if (!t) continue;
+        if (t.indexOf(n) >= 0 || n.indexOf(t) >= 0) return a.href;
+    }
+    return '';
+}"""
+
 
 class PublishActions:
     """微信公众号后台操作封装"""
@@ -422,53 +444,356 @@ class PublishActions:
     # ── 封面上传（文件方式） ──────────────────────────────────────────
 
     def upload_cover_image(self, image_path: str):
-        """上传封面图（文件上传方式，CDN 失败后的回退路径）"""
+        """上传封面图（文件上传方式，CDN 失败后的回退路径）
+
+        新版编辑器实测要点：
+        - 点击封面按钮（.js_cover_btn_area「拖拽或选择封面」）直接唤起系统文件选择器；
+        - 菜单内的 input[type=file] 是模板元素（隐藏），对它 set_input_files 不会
+          触发平台上传逻辑（封面仍为空，点「发表」会被「必须插入一张图片」拦截）；
+        - 因此优先走 expect_file_chooser 注入，结果用 _wait_cover_preview 严格验证
+          （file_id 隐藏字段/非空 background-image），杜绝假阳性。
+        """
         if not image_path or not os.path.exists(image_path):
             logger.warning(f"封面图不存在: {image_path}")
             return
 
         logger.info(f"上传封面图: {image_path}")
 
-        try:
-            result = self._try_select(
-                sel.COVER_FILE_INPUTS,
-                "封面文件上传",
-                timeout_per=3000,
-                screenshot_name="upload_cover_failed",
-                dom_area_selectors=[".cover_area", ".cover-upload", ".weui-desktop-form__upload"],
-            )
-            if result:
-                file_input, matched = result
-                file_input.set_input_files(image_path)
-                logger.info(f"封面图已上传: {matched}")
-                try:
-                    self.page.wait_for_selector(sel.COVER_PREVIEW, timeout=8000)
-                except Exception:
-                    self.page.wait_for_timeout(1500)
-                return
+        # 方式一（新版编辑器，最可靠）：点封面按钮/上传入口唤起原生文件选择器注入文件
+        if self._upload_cover_via_file_chooser(image_path):
+            self._verify_and_report_cover("文件选择器方式")
+            return
 
-            # 兜底：点击上传按钮触发文件选择器
+        # 方式二（旧版编辑器）：对 file input 直接 set_input_files（先展开封面菜单）
+        self._try_click_selectors(
+            sel.COVER_AREA,
+            "封面区域",
+            timeout_per=2000,
+            dom_area_selectors=sel.COVER_AREA,
+        )
+        self.page.wait_for_timeout(600)
+        try:
+            file_input = self.page.locator(", ".join(sel.COVER_FILE_INPUTS)).first
+            file_input.set_input_files(image_path)
+            logger.info("封面文件已设置（file input set_input_files）")
+        except Exception as e:
+            logger.warning(f"file input 设置封面文件失败: {e}")
+
+        self._verify_and_report_cover("file input 方式")
+
+    def _upload_cover_via_file_chooser(self, image_path: str) -> bool:
+        """点击会唤起原生文件选择器的入口，用 expect_file_chooser 注入封面文件
+
+        候选入口（按优先级）：
+        1. 封面按钮本身（.js_cover_btn_area / .select-cover__btn，点击即唤起选择器）；
+        2. 展开菜单后可见的「上传/上传图片/本地上传/选择图片」文本入口。
+        """
+        # 入口 1：封面按钮本身（先确保封面区域可见）
+        try:
+            cover_btn = self.page.locator(".js_cover_btn_area, .select-cover__btn").first
+            if cover_btn.is_visible(timeout=1500):
+                try:
+                    with self.page.expect_file_chooser(timeout=5000) as fc_info:
+                        cover_btn.click()
+                    fc_info.value.set_files(image_path)
+                    logger.info("封面按钮唤起文件选择器，文件已注入")
+                    return True
+                except Exception:
+                    logger.debug("封面按钮点击未唤起文件选择器，尝试菜单内上传入口")
+        except Exception:
+            pass
+
+        # 入口 2：展开封面菜单，找可见的「上传」文本入口（JS 标记后由 Playwright 点击）
+        self._try_click_selectors(
+            sel.COVER_AREA,
+            "封面区域",
+            timeout_per=2000,
+        )
+        self.page.wait_for_timeout(600)
+        entry_info = ""
+        try:
+            entry_info = str(self.page.evaluate("""() => {
+                const vis = (el) => {
+                    if (!el) return false;
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
+                    const s = getComputedStyle(el);
+                    return s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const texts = ['上传图片', '本地上传', '选择图片', '上传'];
+                const cands = Array.from(document.querySelectorAll('a, button, span, div, label'))
+                    .filter(el => {
+                        if (!vis(el)) return false;
+                        const t = (el.innerText || '').trim();
+                        if (!texts.includes(t)) return false;
+                        // 取叶子节点：没有同样命中的可见后代，避免点到外层容器
+                        return !Array.from(el.querySelectorAll('a, button, span, div, label'))
+                            .some(c => vis(c) && texts.includes((c.innerText || '').trim()));
+                    });
+                if (!cands.length) return '';
+                cands[0].setAttribute('data-cover-upload-probe', '1');
+                return cands[0].tagName + '.' + String(cands[0].className).slice(0, 80);
+            }"""))
+        except Exception as e:
+            logger.debug(f"探测封面上传入口异常: {e}")
+        if not entry_info:
+            logger.debug("封面菜单内未找到可见上传入口")
+            return False
+        try:
+            entry = self.page.locator('[data-cover-upload-probe="1"]').first
+            with self.page.expect_file_chooser(timeout=5000) as fc_info:
+                entry.click()
+            fc_info.value.set_files(image_path)
+            logger.info(f"封面上传入口已点击（{entry_info}），文件已注入")
+            return True
+        except Exception as e:
+            logger.debug(f"文件选择器方式注入封面文件失败（{entry_info}）: {e}")
+            return False
+        finally:
             try:
-                upload_btn = self.page.locator(sel.COVER_UPLOAD_BTN).first
-                if upload_btn.is_visible(timeout=3000):
-                    with self.page.expect_file_chooser() as fc_info:
-                        upload_btn.click()
-                    file_chooser = fc_info.value
-                    file_chooser.set_files(image_path)
-                    logger.info("通过文件选择器上传封面图")
-                    try:
-                        self.page.wait_for_selector(sel.COVER_PREVIEW, timeout=8000)
-                    except Exception:
-                        self.page.wait_for_timeout(1500)
-                    return
+                self.page.evaluate(
+                    "() => document.querySelectorAll('[data-cover-upload-probe]')"
+                    ".forEach(e => e.removeAttribute('data-cover-upload-probe'))"
+                )
             except Exception:
                 pass
 
-            logger.warning("未找到封面图上传入口")
+    def _verify_and_report_cover(self, method: str) -> None:
+        """封面上传后验证结果并如实记录（失败则截图 + DOM 状态，不做假阳性放行）"""
+        if self._wait_cover_preview(timeout=15000):
+            logger.info(f"封面设置验证通过（{method}：file_id/封面预览已确认）")
+            return
+        state = self._cover_state()
+        logger.warning(
+            f"封面设置验证未通过（{method}）: {state}"
+            "——发表将被后台以「必须插入一张图片」拦截"
+        )
+        self._screenshot("cover_upload_not_verified")
+        self._diagnose_dom("cover_upload_not_verified", sel.COVER_AREA)
 
+    def _cover_state(self) -> str:
+        """封面当前状态（诊断用，返回 JSON 字符串）"""
+        try:
+            return str(self.page.evaluate("""() => {
+                const fid = document.querySelector('.js_file_id, input[name="file_id"]');
+                const prev = document.querySelector(
+                    '.js_cover_preview_new, .select-cover__preview');
+                return JSON.stringify({
+                    file_id: fid ? String(fid.value || '').slice(0, 40) : 'no-input',
+                    preview_display: prev ? getComputedStyle(prev).display : 'no-el',
+                    preview_bg: prev
+                        ? (getComputedStyle(prev).backgroundImage || '').slice(0, 80) : '',
+                });
+            }"""))
         except Exception as e:
-            logger.error(f"上传封面图失败: {e}")
-            self._screenshot("upload_cover_error")
+            return f"state-query-failed: {e}"
+
+    # ── 正文上传图片（新版编辑器，封面设置的前置步骤） ───────────────────
+
+    def upload_body_image(self, image_path: str) -> bool:
+        """通过正文工具栏「图片 → 上传图片」注入图片（新版编辑器实测路径）
+
+        实测要点：
+        - 工具栏图片下拉菜单用 JS mouseenter+click 展开（Playwright 原生 click 不展开）；
+        - 下拉菜单第一个 tpl_dropdown_menu_item（无 js_img_from_* class）即「上传图片」，
+          内含隐藏 file input；必须用 Playwright 原生点击唤起 filechooser 事件；
+        - 上传成功后正文出现 mmbiz.qpic.cn CDN 图，可作为封面「从正文选择」的素材。
+
+        Returns:
+            True 如果正文出现新图片
+        """
+        if not image_path or not os.path.exists(image_path):
+            logger.warning(f"图片文件不存在: {image_path}")
+            return False
+        try:
+            # 1. JS 展开工具栏图片下拉菜单
+            opened = self.page.evaluate("""() => {
+                const cands = Array.from(document.querySelectorAll('li, a, button, span, div'))
+                    .filter(el => {
+                        const cls = String(el.className || '');
+                        return cls.includes('jsInsertIcon') && cls.includes('img')
+                            && el.offsetParent !== null;
+                    });
+                if (!cands.length) return false;
+                cands[0].dispatchEvent(new MouseEvent('mouseenter', {bubbles: true}));
+                cands[0].click();
+                return true;
+            }""")
+            if not opened:
+                logger.warning("未找到正文工具栏「图片」按钮")
+                return False
+            self.page.wait_for_timeout(1200)
+
+            # 2. 标记「上传图片」菜单项（无 js_img_from_* class 的首项）
+            marked = self.page.evaluate("""() => {
+                const cands = Array.from(
+                    document.querySelectorAll('ul.js_img_dropdown_menu li'))
+                    .filter(li => li.offsetParent !== null
+                        && !String(li.className).includes('js_img_from_'));
+                if (!cands.length) return false;
+                cands[0].setAttribute('data-body-upload', '1');
+                return true;
+            }""")
+            if not marked:
+                logger.warning("图片下拉菜单中未找到「上传图片」项")
+                return False
+
+            # 3. Playwright 原生点击菜单项 → filechooser → 注入文件
+            before_count = self.page.evaluate(
+                "() => document.querySelectorAll('.ProseMirror img').length"
+            )
+            try:
+                with self.page.expect_file_chooser(timeout=6000) as fc_info:
+                    self.page.locator('[data-body-upload="1"]').first.click()
+                fc_info.value.set_files(image_path)
+                logger.info("正文图片文件已注入（工具栏「上传图片」）")
+            except Exception as e:
+                logger.warning(f"正文图片上传（file chooser）失败: {e}")
+                return False
+            finally:
+                try:
+                    self.page.evaluate(
+                        "() => document.querySelectorAll('[data-body-upload]')"
+                        ".forEach(e => e.removeAttribute('data-body-upload'))"
+                    )
+                except Exception:
+                    pass
+
+            # 4. 等待正文出现新图（CDN URL 且可见尺寸）
+            try:
+                self.page.wait_for_function(
+                    """(before) => {
+                        const imgs = Array.from(
+                            document.querySelectorAll('.ProseMirror img'))
+                            .filter(img => (img.getAttribute('src') || '')
+                                && img.getBoundingClientRect().width > 10);
+                        return imgs.length > before;
+                    }""",
+                    arg=before_count,
+                    timeout=15000,
+                )
+                logger.info("正文图片上传成功（已出现 CDN 图）")
+                return True
+            except Exception:
+                logger.warning("正文图片上传后未检测到新图（可能上传失败）")
+                return False
+        except Exception as e:
+            logger.warning(f"正文图片上传异常: {e}")
+            return False
+
+    def set_cover_from_body_v2(self) -> bool:
+        """新版编辑器「从正文选择」设封面（真实鼠标事件弹菜单，实测路径）
+
+        与 set_cover_from_body 的区别：新版封面空态菜单 #js_cover_null 的显示
+        依赖 Playwright 原生鼠标事件（JS click 不改变其 visibility），因此：
+        1) Playwright 点击封面按钮（正文图片列表 ul.appmsg_content_img_list
+           可能遮挡，force 兜底）；
+        2) 等待菜单弹出后 JS 点击「从正文选择」；
+        3) 在「选择图片」对话框确认（_confirm_cover_dialog）。
+        """
+        try:
+            # 1. Playwright 点击封面按钮弹菜单（真实鼠标事件）
+            try:
+                self.page.locator(sel.COVER_AREA[0]).first.click(timeout=8000)
+            except Exception:
+                self.page.locator(sel.COVER_AREA[0]).first.click(timeout=8000, force=True)
+            self.page.wait_for_timeout(1200)
+
+            # 2. 等待封面菜单弹出并点击可见的「从正文选择」（轮询最多 8 秒）
+            #    注意：菜单可能为 fixed 定位，offsetParent 恒为 null，必须用
+            #    rect + computedStyle 判断可见性（否则菜单已弹出也会误判为未弹出）
+            clicked = False
+            for _ in range(16):
+                clicked = self.page.evaluate("""() => {
+                    const vis = (el) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) return false;
+                        const s = getComputedStyle(el);
+                        return s.display !== 'none' && s.visibility !== 'hidden';
+                    };
+                    const cands = Array.from(
+                        document.querySelectorAll('a.js_selectCoverFromContent'))
+                        .filter(a => vis(a));
+                    if (!cands.length) return false;
+                    cands[0].click();
+                    return true;
+                }""")
+                if clicked:
+                    break
+                self.page.wait_for_timeout(500)
+            if not clicked:
+                logger.warning("封面菜单未弹出或「从正文选择」不可见")
+                self._screenshot("cover_menu_not_shown")
+                return False
+            logger.info("已点击「从正文选择」")
+        except Exception as e:
+            logger.warning(f"点击封面菜单失败: {e}")
+            return False
+
+        # 3. 「选择图片」对话框确认（多图时可能需点选/裁剪）
+        return self._confirm_cover_dialog()
+
+    def _visible_dialog(self):
+        """返回当前可见的 .weui-desktop-dialog（页面可能存在多个隐藏模板实例）
+
+        实测：编辑器 DOM 中同时存在模板对话框与实例对话框，直接取 .first
+        会命中隐藏模板（is_visible=False），因此必须遍历取可见实例。
+        """
+        dialogs = self.page.locator(".weui-desktop-dialog")
+        n = dialogs.count()
+        for i in range(n):
+            d = dialogs.nth(i)
+            try:
+                if d.is_visible(timeout=1200):
+                    return d
+            except Exception:
+                continue
+        return None
+
+    def _confirm_cover_dialog(self) -> bool:
+        """在「选择图片」→「编辑封面」两级对话框中完成封面确认（实测路径）
+
+        实测交互链（新版编辑器）：
+        - 「选择图片」页：正文图片列表 li.appmsg_content_img_item，必须先点击
+          图片项选中（「下一步」按钮由 disabled 变 enabled），再点「下一步」；
+        - 「编辑封面」页（裁剪）：点「确认」（weui-desktop-btn_primary）即完成。
+        """
+        try:
+            dlg = self._visible_dialog()
+            if dlg is None:
+                logger.warning("未出现「选择图片」对话框（从正文选择未生效）")
+                return False
+
+            # 1. 选择图片页：点击图片项选中（已默认选中时点击无副作用）
+            try:
+                dlg.locator('.appmsg_content_img_item').first.click(timeout=5000)
+                self.page.wait_for_timeout(1200)
+            except Exception:
+                pass
+
+            # 2. 点「下一步」进入「编辑封面」裁剪页
+            try:
+                dlg.locator('button:has-text("下一步")').first.click(timeout=5000)
+                logger.info("封面对话框已进入「编辑封面」裁剪页")
+                self.page.wait_for_timeout(2000)
+            except Exception as e:
+                logger.warning(f"点击「下一步」失败: {e}")
+                return False
+
+            # 3. 编辑封面页：点「确认」完成设置
+            try:
+                dlg.locator('button:has-text("确认")').first.click(timeout=5000)
+                logger.info("封面对话框已确认（选择图片 → 编辑封面 → 确认）")
+                # 确认后封面预览更新可能较慢（v2 编辑器加载慢时尤其明显），放宽到 15 秒
+                return self._wait_cover_preview(timeout=15000)
+            except Exception as e:
+                logger.warning(f"点击「确认」失败: {e}")
+                self._screenshot("cover_dialog_confirm_missing")
+                return False
+        except Exception as e:
+            logger.warning(f"封面对话框操作异常: {e}")
+            return False
 
     # ── 封面 CDN 上传 ─────────────────────────────────────────────────
 
@@ -551,42 +876,47 @@ class PublishActions:
         self._diagnose_dom("cover_from_body", sel.COVER_AREA)
         return False
 
-    def _wait_cover_preview(self, timeout: int = 8000) -> bool:
-        """等待封面预览出现（兼容新旧版编辑器 DOM）
+    # 封面设置成功信号（严格版，杜绝假阳性）：
+    # 1) 隐藏字段 file_id 非空 = 封面已登记到后台（最可靠）；
+    # 2) 预览容器可见且 background-image 为非空 URL。
+    # 历史教训：空占位 `url("")` 曾被误判为已设置，导致点「发表」被后台拦截。
+    _COVER_SET_JS = """() => {
+        const fid = document.querySelector('.js_file_id, input[name="file_id"]');
+        if (fid && String(fid.value || '').trim()) return true;
+        const prev = document.querySelector(
+            '.js_cover_preview_new, .select-cover__preview, .cover_preview, .js_cover_preview');
+        if (prev && prev.style.display !== 'none') {
+            // 注意：预览容器可能为 fixed 定位，offsetParent 恒为 null，
+            // 必须用 rect + computedStyle 判断可见性（否则封面已设置也会误判为失败）
+            const r = prev.getBoundingClientRect();
+            if (r.width === 0 || r.height === 0) return false;
+            const s = getComputedStyle(prev);
+            if (s.display === 'none' || s.visibility === 'hidden') return false;
+            const bg = s.backgroundImage || '';
+            const m = bg.match(/url\\(["']?([^"')]+)["']?\\)/);
+            if (m && m[1]) return true;
+        }
+        return false;
+    }"""
 
-        - 旧版：等待 .cover_preview / .js_cover_preview 元素出现即视为成功；
-        - 新版：无 preview 类名时，退化为等待封面区域内出现带非空 src 的 img。
+    def _wait_cover_preview(self, timeout: int = 8000) -> bool:
+        """等待封面设置成功（严格验证，无假阳性）
+
+        - 新版：轮询 file_id 隐藏字段非空 / 预览容器获得非空 background-image；
+          注意空占位 `url("")` 不算已设置；
+        - 旧版：兜底等待 .cover_preview / .js_cover_preview 元素出现。
         """
         try:
-            self.page.wait_for_selector(sel.COVER_PREVIEW, timeout=timeout)
+            self.page.wait_for_function(self._COVER_SET_JS, timeout=timeout)
+            return True
         except Exception:
-            try:
-                self.page.wait_for_function(
-                    """() => {
-                        const el = document.querySelector('.js_cover_area, .cover_area, .cover-panel');
-                        const img = el && el.querySelector('img');
-                        return !!(img && img.src && img.src.trim());
-                    }""",
-                    timeout=timeout,
-                )
-                return True
-            except Exception:
-                return False
-        # preview 已出现（旧版成功信号）；img src 可能延迟加载，等待片刻并记录诊断
+            pass
+        # 旧版编辑器：等待封面预览元素出现（存在即成功信号）
         try:
-            self.page.wait_for_timeout(800)
-            has_src = self.page.evaluate(
-                """() => {
-                    const el = document.querySelector('.cover_preview, .js_cover_preview');
-                    const img = el && el.querySelector('img');
-                    return !!(img && img.src && img.src.trim());
-                }"""
-            )
-            if not has_src:
-                logger.warning("封面预览已出现但未检测到图片 src（可能仍在加载，按成功处理）")
-        except Exception as e:
-            logger.debug(f"封面预览校验异常（按成功处理）: {e}")
-        return True
+            self.page.wait_for_selector(sel.COVER_PREVIEW, timeout=2000)
+            return True
+        except Exception:
+            return False
 
     # ── 摘要 ──────────────────────────────────────────────────────────
 
@@ -615,22 +945,31 @@ class PublishActions:
     # ── 保存草稿 ──────────────────────────────────────────────────────
 
     def dismiss_dialogs(self):
-        """关闭可能拦截点击的弹窗（教育弹窗/新手引导等）"""
+        """关闭可能拦截点击的弹窗（教育弹窗/新手引导等）
+
+        安全约束：绝不点击「确定/确认」类按钮——发布确认对话框的确认
+        只能由 publish() 在监控窗口内显式点击，否则可能在监控外真实发布。
+        """
         try:
             closed = self.page.evaluate("""() => {
                 let count = 0;
-                // 关闭可见弹窗的「我知道了/关闭」按钮
+                // 关闭可见弹窗的「我知道了/关闭」按钮（排除确定/确认）
                 const dismissBtns = Array.from(document.querySelectorAll(
                     '.education-dialog button, .weui-desktop-dialog button, ' +
                     '.weui-desktop-dialog__close-btn, [class*=dialog] .weui-desktop-btn'
                 )).filter(el => {
+                    // 注意：对话框为 position:fixed，offsetParent 恒为 null，
+                    // 必须用 rect + computedStyle 判断可见性（否则漏掉弹窗内按钮）
+                    const r = el.getBoundingClientRect();
+                    if (r.width === 0 || r.height === 0) return false;
                     const s = getComputedStyle(el);
-                    return s.display !== 'none' && el.offsetParent !== null;
+                    return s.display !== 'none' && s.visibility !== 'hidden';
                 });
                 for (const btn of dismissBtns) {
                     const text = (btn.textContent || '').trim();
                     const cls = btn.className.toString();
-                    if (text.includes('我知道了') || text.includes('关闭') || text.includes('确定') ||
+                    if (/确定|确认/.test(text)) continue;  // 绝不点确认（防误发布）
+                    if (text.includes('我知道了') || text.includes('关闭') ||
                         cls.includes('close') || text.includes('跳过') || text.includes('知道了')) {
                         btn.click();
                         count++;
@@ -645,6 +984,32 @@ class PublishActions:
         except Exception as e:
             logger.debug(f"关闭弹窗异常: {e}")
             return 0
+
+    def _cancel_visible_dialog(self) -> bool:
+        """取消当前可见的对话框（点「取消」；无取消按钮则点关闭图标）
+
+        用于发布重试前清理迟到的确认对话框，绝不用「确定」关闭。
+        """
+        try:
+            cancelled = self.page.evaluate("""() => {
+                const btns = Array.from(document.querySelectorAll('button, a'))
+                    .filter(b => b.offsetParent !== null &&
+                        /^(取消|关闭)$/.test((b.innerText || '').trim()));
+                if (btns.length) { btns[0].click(); return 'cancel'; }
+                const closes = Array.from(document.querySelectorAll(
+                    '.weui-desktop-dialog__close-btn, [class*="dialog"] [class*="close"]'
+                )).filter(el => el.offsetParent !== null);
+                if (closes.length) { closes[0].click(); return 'close-icon'; }
+                return '';
+            }""")
+            if cancelled:
+                logger.info(f"已取消可见对话框（{cancelled}）")
+                self.page.wait_for_timeout(400)
+                return True
+            return False
+        except Exception as e:
+            logger.debug(f"取消对话框异常: {e}")
+            return False
 
     def save_draft(self):
         """保存为草稿"""
@@ -748,48 +1113,391 @@ class PublishActions:
 
     # ── 发布 ──────────────────────────────────────────────────────────
 
-    def publish(self):
-        """发布文章（群发）"""
+    def publish(self, title: str = "") -> bool:
+        """发布文章（群发）
+
+        判定纪律（防假阳性）：
+        - 必须点到确认对话框并确认后，才进入成功信号等待；
+        - 必须检测到真实成功信号（页面跳转/成功提示）才返回 True；
+        - 点击后无确认对话框、或确认后无成功信号，一律判失败并留截图证据。
+
+        新版流程实测（2026-08-31）：点击编辑器「发表」后，v2 编辑器会先自动保存
+        并跳转旧版编辑器（URL 出现 appmsgid），随后自动弹出确认对话框①（标题「发表」，
+        含「群发通知/定时发表」选项，按钮「发表」「取消」）——确认按钮文本是
+        「发表」而非「确定/确认」；点击「发表」后还会弹出确认框②
+        （「已开启群发通知…继续发表 取消」），必须再点「继续发表」发布才真正提交。
+        跳转+加载需要数秒，等待窗口放宽到 15 秒（两级确认都在其中完成）。
+        """
         logger.info("发布文章...")
 
         # 先关闭可能拦截的弹窗
         self.dismiss_dialogs()
 
-        result = self._try_select(
-            sel.PUBLISH_BUTTONS,
-            "发布",
-            timeout_per=3000,
-            screenshot_name="publish_failed",
-            dom_area_selectors=["#js_send", ".weui-desktop-btn"],
-        )
-        if result is None:
+        # 记录点击前 URL，用于判定发布后是否发生页面跳转（强成功信号）
+        pre_url = self._current_url()
+
+        # 点击发表并等待确认对话框（最多 2 轮；v2→旧版跳转后需重新定位按钮）
+        dialog_confirmed = False
+        for attempt in (1, 2):
+            result = self._try_select(
+                sel.PUBLISH_BUTTONS,
+                "发布",
+                timeout_per=3000,
+                screenshot_name="publish_failed",
+                dom_area_selectors=["#js_send", ".weui-desktop-btn"],
+            )
+            if result is None:
+                # 找不到发表按钮（可能已跳转/对话框遮挡），直接等待确认对话框
+                if self._wait_publish_confirm_dialog(timeout_ms=15000):
+                    dialog_confirmed = True
+                break
+            el, matched = result
+            try:
+                el.click(timeout=5000)
+            except Exception:
+                logger.warning("发布按钮被遮挡，尝试 force 点击")
+                self.dismiss_dialogs()
+                self.page.wait_for_timeout(300)
+                try:
+                    el.click(timeout=5000, force=True)
+                except Exception as e:
+                    logger.warning(f"第 {attempt} 次点击发布按钮失败: {e}")
+                    continue
+            if self._wait_publish_confirm_dialog(timeout_ms=15000):
+                dialog_confirmed = True
+                break
+            logger.warning(
+                f"第 {attempt} 次点击发表后未出现确认对话框"
+                "（可能页面在 v2→旧版编辑器跳转中，或被表单校验拦截，如缺少封面图/摘要）"
+            )
+            self._screenshot(f"publish_no_dialog_{attempt}")
+            # 竞态防护：若确认对话框在等待超时后才出现，先「取消」它——
+            # 绝不能用 dismiss_dialogs（它会点「确定」导致在监控窗口外真实发布）
+            self._cancel_visible_dialog()
+            self.page.wait_for_timeout(800)
+
+        if not dialog_confirmed:
+            # 历史假阳性根因：此处曾把「无确认对话框」当作「已直接发布」返回 True。
+            # 后台点击「发表」必经确认对话框；对话框未出现 = 发布动作未成立。
+            logger.error(
+                "发布失败：两次点击发表按钮后确认对话框均未出现，"
+                "文章未发布（最可能被表单校验拦截，如缺少封面图）。"
+                "证据截图: publish_no_dialog_*"
+            )
+            self._diagnose_dom("publish_no_dialog", ["#js_send", ".weui-desktop-dialog"])
             return False
 
-        el, matched = result
-        # 先尝试正常点击，若被遮挡则 force 点击
-        try:
-            el.click(timeout=5000)
-        except Exception:
-            logger.warning("发布按钮被遮挡，尝试 force 点击")
-            self.dismiss_dialogs()
-            self.page.wait_for_timeout(300)
-            el.click(timeout=5000, force=True)
-        # 等待确认对话框
-        try:
-            confirm_btn = self.page.locator(sel.CONFIRM_BUTTON).first
-            confirm_btn.wait_for(state="visible", timeout=5000)
-            confirm_btn.click()
-            try:
-                self.page.wait_for_selector(sel.TOAST, timeout=10000)
-            except Exception:
-                self.page.wait_for_timeout(2000)
-        except Exception:
-            logger.info("无确认对话框，可能已直接发布")
-            self.page.wait_for_timeout(1500)
+        # 确认后必须等到真实成功信号（成功提示/页面跳转）；无信号即失败
+        ok, evidence = self._wait_publish_outcome(pre_url)
+        if ok:
+            logger.info(f"文章已发布（成功信号: {evidence}）")
+            self._screenshot("published")
+            return True
 
-        logger.info(f"文章已发布: {matched}")
-        self._screenshot("published")
-        return True
+        logger.error(f"发布失败：确认发表后未检测到真实成功信号: {evidence}")
+        self._screenshot("publish_no_success_signal")
+        return False
+
+    def _wait_publish_confirm_dialog(self, timeout_ms: int = 15000) -> bool:
+        """等待发表确认对话框并逐级确认（实测为两级确认流程）
+
+        流程实测（2026-08-31，probe-post-confirm 60 秒采样证实）：
+        1. 确认框①（标题「发表」，含「群发通知/定时发表」选项，按钮「发表」「取消」）
+           ——点击「发表」后并不会直接提交发布；
+        2. 确认框②（「已开启群发通知…查看详情 继续发表 取消」）
+           ——必须再点「继续发表」，发布动作才真正提交。
+
+        按钮匹配限定在可见 .weui-desktop-dialog 内、文本精确匹配
+        （「继续发表」先于「发表」判定），避免误点页面底部工具栏的「发表」按钮。
+
+        Returns:
+            True 表示确认完成（两级都已点击，或第二级未出现/已关闭——
+            最终是否成功由 _wait_publish_outcome 的真实成功信号判定）；
+            False 表示确认框从未出现（发布动作未成立）。
+        """
+        deadline = time.time() + timeout_ms / 1000.0
+        stage = 0  # 0=尚未点第一级；1=已点第一级，等待第二级
+        while time.time() < deadline:
+            try:
+                hit = self.page.evaluate("""() => {
+                    const vis = (el) => {
+                        if (!el) return false;
+                        const r = el.getBoundingClientRect();
+                        if (r.width === 0 || r.height === 0) return false;
+                        const s = getComputedStyle(el);
+                        return s.display !== 'none' && s.visibility !== 'hidden';
+                    };
+                    const dlg = Array.from(
+                        document.querySelectorAll('.weui-desktop-dialog')).find(vis);
+                    if (!dlg) return 'no-dialog';
+                    // 第二级：继续发表（文本精确匹配，先于第一级判定）
+                    const cont = Array.from(dlg.querySelectorAll('button, a'))
+                        .find(b => vis(b) && (b.innerText || '').trim() === '继续发表');
+                    if (cont) { cont.click(); return 'continue-confirmed'; }
+                    // 第一级：发表
+                    const target = Array.from(dlg.querySelectorAll('button, a'))
+                        .find(b => vis(b) && (b.innerText || '').trim() === '发表');
+                    if (!target) return 'dialog-no-publish-btn';
+                    target.click();
+                    return 'confirmed';
+                }""")
+                if hit == "continue-confirmed":
+                    logger.info("已点击第二级确认框的「继续发表」按钮，发布动作已提交")
+                    return True
+                if hit == "confirmed":
+                    logger.info("已点击确认框①的「发表」按钮，等待第二级确认（如有）")
+                    stage = 1
+                    continue
+                if hit == "dialog-no-publish-btn":
+                    # 非发表确认对话框（可能是其他拦截框），取消避免干扰主流程
+                    self._cancel_visible_dialog()
+            except Exception:
+                pass
+            self.page.wait_for_timeout(500)
+        return stage == 1
+
+    # ── 发布结果验证 ──────────────────────────────────────────────────
+
+    def _current_url(self) -> str:
+        """当前页面 URL（异常时返回空串，不中断发布流程）"""
+        try:
+            return self.page.url or ""
+        except Exception:
+            return ""
+
+    def _mp_token(self) -> str:
+        """从当前页面 URL 提取后台 token（内部页面必须带 token 才能访问）"""
+        import re as _re
+
+        m = _re.search(r"token=(\d+)", self._current_url())
+        if m:
+            return m.group(1)
+        try:
+            return str(self.page.evaluate(
+                "() => (location.href.match(/token=(\\d+)/) || [])[1] || ''"
+            ))
+        except Exception:
+            return ""
+
+    def _wait_publish_outcome(self, pre_url: str, timeout_ms: int = 0) -> tuple[bool, str]:
+        """点击确认发布后，等待真实的发布结果信号
+
+        成功信号（任一即可）：
+        1. 页面跳转：URL 变化且不再是编辑器页（appmsg_edit）——发布成功后后台会离开编辑器；
+        2. 页面出现成功提示文本（selectors 的 publish_success_texts）。
+        失败信号：页面出现表单校验/发送失败文本（publish_fail_texts）→ 提前判失败。
+
+        特殊状态（实测 2026-08-31）：群发提交后可能触发微信风控——弹出
+        「微信验证」弹窗，要求管理员扫码验证。此时不判失败：等待用户扫码，
+        验证通过后发布自动继续；等待窗口在首次检测到时延长 300 秒（默认超时 20 秒
+        是给扫码留时间），仍无信号才判失败。
+
+        Returns:
+            (是否成功, 证据描述)
+        """
+        if timeout_ms <= 0:
+            timeout_ms = int(
+                self.config.get("wechat", {}).get("publish_outcome_timeout_ms", 20000)
+            )
+        success_texts = list(sel.get_selectors().get("publish_success_texts") or [])
+        fail_texts = list(sel.get_selectors().get("publish_fail_texts") or [])
+        js = f"""() => {{
+            const text = (document.body && document.body.innerText) || '';
+            for (const t of {json.dumps(fail_texts, ensure_ascii=False)})
+                if (text.includes(t)) return 'FAIL:' + t;
+            for (const t of {json.dumps(success_texts, ensure_ascii=False)})
+                if (text.includes(t)) return 'OK:' + t;
+            return '';
+        }}"""
+        verify_js = """() => {
+            const t = (document.body && document.body.innerText) || '';
+            // 微信验证弹窗特征文本（需管理员扫码）；与正文含「验证」字样区分：
+            // 用完整片段「扫码后，请联系管理员进行验证」匹配
+            return t.includes('扫码后，请联系管理员进行验证');
+        }"""
+        deadline = time.time() + timeout_ms / 1000.0
+        verify_seen = False
+        while time.time() < deadline:
+            # 信号 1：页面已离开编辑器（最强成功信号）
+            url = self._current_url()
+            if url and pre_url and url != pre_url and "appmsg_edit" not in url:
+                return True, f"页面已跳转: {url[:100]}"
+            # 信号 2/3：成功或校验失败文本
+            try:
+                hit = self.page.evaluate(js)
+                if isinstance(hit, str):
+                    if hit.startswith("FAIL:"):
+                        return False, f"页面出现校验失败提示「{hit[5:]}」（发布被后台拦截）"
+                    if hit.startswith("OK:"):
+                        return True, f"页面出现成功提示「{hit[3:]}」"
+            except Exception:
+                pass
+            # 特殊状态：微信验证弹窗（群发风控，需管理员扫码）
+            if not verify_seen:
+                try:
+                    if self.page.evaluate(verify_js):
+                        verify_seen = True
+                        logger.warning(
+                            "检测到「微信验证」弹窗：群发被风控拦截，需管理员扫码验证。"
+                            "请在浏览器窗口中完成扫码，验证通过后发布将自动继续"
+                        )
+                        self._screenshot("wechat_verify_waiting")
+                        # 延长等待窗口：给足人工扫码时间（首次检测时生效一次）
+                        verify_deadline = time.time() + 300
+                        if verify_deadline > deadline:
+                            deadline = verify_deadline
+                except Exception:
+                    pass
+            self.page.wait_for_timeout(500)
+        return False, f"{timeout_ms // 1000} 秒内无成功信号且页面未跳转（可能仍停留在编辑器）"
+
+    def verify_published_online(self, title: str, timeout_each: int = 30000) -> bool:
+        """发布后复核：到公众号后台「发表记录」核实文章是否真实存在
+
+        判定发布真实成功的最终关口——拦截「点击流程看似完成、
+        但文章实际未发表」的假阳性。命中规则：发表记录页文本中
+        包含标题前缀（列表中可能被截断显示）。
+        """
+        if not title:
+            logger.warning("发布复核中止：标题为空")
+            return False
+        needle = self._title_needle(title)
+        session_lost = False
+
+        # 路线 1：访问发表记录页（多候选 URL）。
+        # 实测：后台内部页面必须带 token 参数，否则被重定向到首页/登录页；
+        # 先进后台首页（自动带上 token），再拼接 token 访问目标页。
+        try:
+            self.page.goto(WECHAT_MP_URL, wait_until="domcontentloaded", timeout=timeout_each)
+            self.page.wait_for_timeout(2500)
+        except Exception as e:
+            logger.warning(f"后台首页导航失败: {e}")
+        if self._on_login_page():
+            session_lost = True
+            logger.warning("后台首页为登录页（会话失效），发表记录复核不可用")
+        token = self._mp_token()
+        for url in PUBLISHED_LIST_URLS:
+            if session_lost:
+                break
+            target = url + (f"&token={token}&lang=zh_CN" if token else "")
+            try:
+                self.page.goto(target, wait_until="domcontentloaded", timeout=timeout_each)
+                self.page.wait_for_timeout(3500)
+            except Exception as e:
+                logger.warning(f"发表记录页导航失败: {target}: {e}")
+                continue
+            if self._on_login_page():
+                # 被重定向到登录页/首页：会话失效或路由被拦截，不能误报为「文章不存在」
+                session_lost = True
+                logger.warning(f"发表记录页跳转后被重定向（会话失效或路由拦截）: {url}")
+                continue
+            if self._page_contains_text(needle):
+                logger.info(f"发布复核通过：在发表记录中找到文章（{url}）")
+                self._screenshot("verified_in_published_list")
+                # 提取文章链接供落库（best-effort，取不到保持空串）
+                self.last_publish_url = self._extract_published_url(needle)
+                if self.last_publish_url:
+                    logger.info(f"已捕获发表文章链接: {self.last_publish_url}")
+                return True
+            logger.warning(f"发表记录页未找到文章: {url}")
+
+        # 路线 2：回后台首页，经侧边栏「发表记录」菜单进入（兼容 URL 改版）
+        try:
+            self.page.goto(WECHAT_MP_URL, wait_until="domcontentloaded", timeout=timeout_each)
+            self.page.wait_for_timeout(1500)
+            if self._on_login_page():
+                session_lost = True
+                logger.warning("后台首页被重定向到登录页（会话失效），侧边栏路线不可用")
+            else:
+                for entry in sel.get_selectors().get("published_list_entries") or []:
+                    try:
+                        el = self.page.locator(entry).first
+                        if not el.is_visible(timeout=2000):
+                            continue
+                        el.click()
+                        self.page.wait_for_timeout(2500)
+                        # 部分版本需在「草稿箱/发表记录」页内切换到「已发表」标签
+                        for tab in sel.get_selectors().get("published_tab") or []:
+                            try:
+                                t = self.page.locator(tab).first
+                                if t.is_visible(timeout=1500):
+                                    t.click()
+                                    self.page.wait_for_timeout(1500)
+                                    break
+                            except Exception:
+                                continue
+                        if self._page_contains_text(needle):
+                            logger.info("发布复核通过：经侧边栏进入发表记录后找到文章")
+                            self._screenshot("verified_in_published_list")
+                            self.last_publish_url = self._extract_published_url(needle)
+                            if self.last_publish_url:
+                                logger.info(f"已捕获发表文章链接: {self.last_publish_url}")
+                            return True
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.warning(f"侧边栏路线复核异常: {e}")
+
+        if session_lost:
+            logger.error(
+                f"发布复核失败：会话已失效（被重定向到登录页），无法确认文章「{title[:30]}」是否已发表"
+                "——请重新登录（python main.py login）后人工核实"
+            )
+        else:
+            logger.error(f"发布复核失败：所有发表记录入口均未找到文章「{title[:30]}」")
+        self._screenshot("verify_published_not_found")
+        return False
+
+    def _extract_published_url(self, needle: str) -> str:
+        """在发表记录页按标题匹配提取文章链接
+
+        best-effort：列表标题可能被截断，故用双向包含匹配；
+        取不到时返回空串（不影响复核判定，仅影响 publish_url 落库）。
+        """
+        try:
+            url = self.page.evaluate(_PUBLISHED_LINK_JS, {"needle": needle}) or ""
+            return str(url)
+        except Exception as e:
+            logger.debug(f"提取发表文章链接失败（忽略）: {e}")
+            return ""
+
+    def _on_login_page(self) -> bool:
+        """当前页面是否为登录页/未登录状态（复核时区分「会话失效」与「文章不存在」）"""
+        url = self._current_url()
+        if "login" in url or "wx_open" in url:
+            return True
+        # 新版后台：部分页面不重定向，直接在页面上展示登录入口（无侧边栏/管理面板）
+        try:
+            has_login_entry = bool(self.page.evaluate("""() => {
+                const links = Array.from(document.querySelectorAll('a[href*="loginpage"], a[href*="login"]'))
+                    .filter(a => a.offsetParent !== null);
+                return links.length > 0;
+            }"""))
+            has_admin_panel = bool(self.page.evaluate("""() => {
+                return !!document.querySelector(
+                    '.weui-desktop-menu, .menu_container, [class*="new-creation"], .appmsg_editor');
+            }"""))
+            return has_login_entry and not has_admin_panel
+        except Exception:
+            return False
+
+    @staticmethod
+    def _title_needle(title: str) -> str:
+        """标题匹配片段：去空白取前 20 字（兼容列表截断/空白差异）"""
+        return "".join(title.split())[:20]
+
+    def _page_contains_text(self, text: str) -> bool:
+        """当前页面可见文本是否包含指定片段（去空白比对）"""
+        try:
+            found = self.page.evaluate(
+                f"""() => {{
+                    const body = document.body ? (document.body.innerText || '') : '';
+                    return body.replace(/\\s+/g, '').includes({json.dumps(text, ensure_ascii=False)});
+                }}"""
+            )
+            return bool(found)
+        except Exception:
+            return False
 
     # ── 预览截图 ──────────────────────────────────────────────────────
 
@@ -823,8 +1531,14 @@ class PublishActions:
               false = 封面仍走 CDN 上传拿 URL，但不注入正文、不用「从正文选择」，设置封面走旧文件上传
 
         Returns:
-            {"success": bool, "mode": str, "error": str, "preview_path": str}
+            {"success": bool, "mode": str, "error": str, "preview_path": str, "url": str}
+
+            url 为发表后的文章链接（复核页按标题匹配提取，取不到为空串）；
+            最终注入编辑器的 HTML 另存于 self.last_published_html（占位符已解析）。
         """
+        # 每次发布重置产物（最终 HTML / 发表后 URL），避免跨次串味
+        self.last_published_html = ""
+        self.last_publish_url = ""
         try:
             # 每次发布独立统计（避免跨次累计）
             self._selector_stats = {}
@@ -867,14 +1581,35 @@ class PublishActions:
             if cover_url and cover_in_body:
                 html_content = self.prepend_cover_image(html_content, cover_url)
             self.fill_content_html(html_content)
+            # 记录最终注入编辑器的 HTML（占位符已解析为 CDN 外链、封面已注入），
+            # 供 publisher/workflow 落库，实现「所见即所存」。
+            self.last_published_html = html_content
 
             # 6. 设置封面：
-            #    - cover_in_body=true（默认）：优先「从正文选择」（封面已在正文首图），失败回退旧文件上传；
+            #    - cover_in_body=true（默认）：优先「从正文选择」（封面已在正文首图），失败回退新路径：
+            #      正文工具栏上传图片 + 封面「从正文选择」（新版编辑器实测链路），再失败才走旧文件上传；
             #    - cover_in_body=false：封面仍走 CDN 上传拿 URL（统一图片路径），但不注入正文、
             #      不用「从正文选择」，设置封面直接走旧的文件上传。
+            cover_set = False
             if cover_path:
                 if not (cover_in_body and cover_url and self.set_cover_from_body()):
-                    self.upload_cover_image(cover_path)
+                    # 新路径（新版编辑器实测）：正文工具栏上传图片 → 封面「从正文选择」
+                    if not self.upload_body_image(cover_path):
+                        logger.warning("正文图片上传失败，回退旧文件上传封面")
+                        self.upload_cover_image(cover_path)
+                    elif not self.set_cover_from_body_v2():
+                        # 偶发时序问题（页面加载慢/对话框切换延迟）导致首次失败时重试一次
+                        logger.warning("「从正文选择」设封面失败，重试一次")
+                        if not self.set_cover_from_body_v2():
+                            logger.warning("「从正文选择」设封面重试仍失败，回退旧文件上传封面")
+                            self.upload_cover_image(cover_path)
+                # 封面是「发表」的硬性要求，这里验证设置结果（而非假设成功）
+                try:
+                    cover_set = self._wait_cover_preview(timeout=5000)
+                except Exception:
+                    cover_set = False
+                if not cover_set:
+                    logger.warning("封面设置结果未验证到封面预览，发表可能被后台拦截")
 
             # 7. 填写摘要
             self.fill_summary(summary)
@@ -890,14 +1625,55 @@ class PublishActions:
                     "mode": "draft",
                     "error": "" if success else "保存草稿失败",
                     "preview_path": preview_path,
+                    "url": "",
+                }
+            elif not cover_set:
+                # 公众号要求「发表」必须设置封面，缺失时点击发表会被后台拦截。
+                # 降级保存草稿：文章不丢失，人工补封面后可再发表；明确报告降级事实。
+                logger.error("封面未设置：公众号要求发表必须设置封面，降级为保存草稿（防文章丢失）")
+                saved = self.save_draft()
+                result = {
+                    "success": saved,
+                    "mode": "draft",
+                    "error": "缺少封面图，无法直接发表，已降级保存为草稿"
+                    + ("" if saved else "；且草稿保存也失败，请人工检查编辑器状态"),
+                    "preview_path": preview_path,
+                    "url": "",
                 }
             else:
-                success = self.publish()
+                success = self.publish(title=title)
+                error = "" if success else "发布动作未检测到成功信号（证据截图: publish_no_*）"
+
+                # 发布失败时先存草稿，防止后续复核导航离开编辑器导致文章内容丢失
+                if not success:
+                    try:
+                        if self.save_draft():
+                            logger.info("发布失败，文章已降级保存为草稿（防内容丢失）")
+                    except Exception as e:
+                        logger.warning(f"发布失败后保存草稿异常（忽略）: {e}")
+
+                # 发布后复核（防假阳性/假阴性的最终关口）：到「发表记录」核实文章真实存在。
+                # - publish 判成功但复核找不到 → 推翻为失败（拦截假阳性）；
+                # - publish 判失败但复核找到 → 改判成功（容忍成功信号选择器过期的假阴性）。
+                if self.config.get("wechat", {}).get("verify_published", True):
+                    verified = self.verify_published_online(title)
+                    if verified:
+                        if not success:
+                            logger.warning("发布动作信号异常，但发表记录复核找到文章，判定为已真实发布")
+                        success = True
+                        error = ""
+                    elif success:
+                        success = False
+                        error = "发布结果复核失败：发表记录中未找到该文章（发布未真实生效）"
+                        logger.error(error)
+
                 result = {
                     "success": success,
                     "mode": "publish",
-                    "error": "" if success else "发布失败",
+                    "error": error,
                     "preview_path": preview_path,
+                    # 发表后的文章链接（复核页按标题匹配提取；取不到为空串，不影响判定）
+                    "url": self.last_publish_url if success else "",
                 }
 
             # 10. 输出本次发布的选择器命中率统计
@@ -914,6 +1690,7 @@ class PublishActions:
                 "mode": self.publish_mode,
                 "error": str(e),
                 "preview_path": "",
+                "url": "",
             }
 
     # ── 辅助方法 ──────────────────────────────────────────────────────

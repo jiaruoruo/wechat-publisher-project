@@ -1,6 +1,7 @@
 """tests for tools/publish_lock.py - FIFO + queue cleanup"""
 
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -18,7 +19,9 @@ from tools.publish_lock import (
 
 class TestPublishLock(unittest.TestCase):
     def setUp(self):
-        self.path = os.path.join(tempfile.mkdtemp(), ".publish.lock")
+        self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir, True)
+        self.path = os.path.join(self._tmpdir, ".publish.lock")
 
     def _wait_tickets(self, lock, n, timeout=5.0):
         deadline = time.time() + timeout

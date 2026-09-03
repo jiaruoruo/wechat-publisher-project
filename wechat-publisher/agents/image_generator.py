@@ -49,6 +49,22 @@ class ImageGeneratorAgent(BaseAgent):
             except Exception as e:
                 logger.error(f"封面图生成失败: {e}")
 
+        # 封面兜底：云端图片生成不可用（未配置 API Key/欠费/网络异常）时，
+        # 本地渲染一张兜底封面。公众号「发表」强制要求封面，无封面只能存草稿，
+        # 兜底封面保证文章仍能真实发表（用户可在后台替换为更精美的封面）。
+        if not cover_image_path:
+            try:
+                fallback_title = (
+                    state.get("article_title") or cover_prompt_cn or "文章封面"
+                )
+                cover_image_path = self._local_fallback_cover(fallback_title)
+                if cover_image_path:
+                    logger.warning(
+                        f"图片生成服务不可用，已使用本地渲染兜底封面: {cover_image_path}"
+                    )
+            except Exception as e:
+                logger.error(f"兜底封面生成也失败: {e}")
+
         # 3. 生成文内插图
         inline_images = []
         for i, desc in enumerate(inline_descriptions):
@@ -77,6 +93,59 @@ class ImageGeneratorAgent(BaseAgent):
                 "inline_images_count": len(inline_images),
             },
         }
+
+    def _local_fallback_cover(self, text: str) -> str:
+        """本地渲染兜底封面：渐变背景 + 标题文字（900x383，公众号封面比例）
+
+        不依赖任何外部 API，保证图片生成服务不可用时封面硬性要求仍能满足。
+        字体缺失时退化为 PIL 默认字体（中文可能显示为方块，但发布不受阻）。
+        """
+        from PIL import Image, ImageDraw, ImageFont
+
+        width, height = 900, 383
+        img = Image.new("RGB", (width, height))
+        draw = ImageDraw.Draw(img)
+
+        # 竖向渐变背景（深蓝 → 青绿）
+        top, bottom = (24, 60, 110), (10, 140, 120)
+        for y in range(height):
+            ratio = y / height
+            color = tuple(
+                int(top[i] + (bottom[i] - top[i]) * ratio) for i in range(3)
+            )
+            draw.line([(0, y), (width, y)], fill=color)
+
+        # 标题：去空白截断，避免超出画面
+        title = "".join(text.split())[:22]
+        font = None
+        for fp in (
+            r"C:\Windows\Fonts\msyh.ttc",
+            r"C:\Windows\Fonts\msyh.ttf",
+            r"C:\Windows\Fonts\simhei.ttf",
+        ):
+            try:
+                font = ImageFont.truetype(fp, 46)
+                break
+            except Exception:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+
+        try:
+            bbox = draw.textbbox((0, 0), title, font=font)
+            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        except Exception:
+            tw, th = len(title) * 46, 46
+        draw.text(
+            ((width - tw) // 2, (height - th) // 2),
+            title,
+            fill=(255, 255, 255),
+            font=font,
+        )
+
+        path = self.image_generator.images_dir / f"cover_fallback_{uuid.uuid4().hex[:8]}.png"
+        img.save(path)
+        return str(path)
 
     def _extract_image_markers(self, content: str) -> list[str]:
         """提取文章中所有 [IMAGE: ...] 标记的描述"""

@@ -6,6 +6,7 @@ cmd_check 除了展示配置，还会按 browser.screenshot_retention_days
 
 import io
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -21,17 +22,30 @@ except ImportError:
     MAIN_AVAILABLE = False
 
 
+# 测试期间创建的临时目录，由 tearDownModule 统一清理（避免在项目根目录堆积 tmp*）
+_TMPDIRS: list[str] = []
+
+
 def _config(retention=30, lock_timeout=0):
+    """构造测试用 config；screenshot_dir 用临时目录，登记后由 tearDownModule 统一清理"""
+    tmpdir = tempfile.mkdtemp()
+    _TMPDIRS.append(tmpdir)
     return {
         "models": {},
         "content": {},
         "wechat": {"publish_mode": "draft", "publish_lock_timeout": lock_timeout},
         "browser": {
-            "screenshot_dir": tempfile.mkdtemp(),
+            "screenshot_dir": tmpdir,
             "screenshot_retention_days": retention,
         },
         "feishu": {},
     }
+
+
+def tearDownModule():
+    """统一清理测试期间创建的临时目录，避免在项目根目录堆积 tmp*"""
+    while _TMPDIRS:
+        shutil.rmtree(_TMPDIRS.pop(), True)
 
 
 @unittest.skipUnless(MAIN_AVAILABLE, "运行时依赖缺失")

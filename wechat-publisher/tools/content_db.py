@@ -85,6 +85,8 @@ class ContentDB:
                 metadata TEXT
             )
         """)
+        # 轻量 schema 迁移：已有库文件补列（历史库建表时没有 html 列）
+        self._ensure_column(conn, "articles", "html", "html TEXT")
         # 为 created_at 建索引：避免 get_recent_titles / get_article_count
         # 在文章积累后做全表扫描（WHERE created_at >= ? 命中索引）。
         conn.execute(
@@ -103,6 +105,14 @@ class ContentDB:
         """)
         conn.commit()
         logger.info(f"数据库初始化完成: {self.db_path}")
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, definition: str):
+        """列不存在则 ALTER TABLE 添加（兼容历史库文件，无需重建表）"""
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+            logger.info(f"数据库迁移：{table} 新增列 {column}")
 
     def save_article(
         self,
@@ -147,6 +157,37 @@ class ContentDB:
             )
         conn.commit()
 
+    def delete_orphan_drafts(self, days: int = 7) -> int:
+        """删除 N 天前仍未发表的孤儿草稿（发布失败/中断残留），返回删除条数
+
+        这些行是「运行了但没发出去」的残留（如封面缺失降级、发布失败中断），
+        保留会干扰选题去重与统计。已发表/近期记录不受影响。
+        """
+        cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat()
+        conn = self._get_conn()
+        cur = conn.execute(
+            "DELETE FROM articles WHERE status = 'draft' AND created_at < ?",
+            (cutoff_iso,),
+        )
+        conn.commit()
+        deleted = cur.rowcount or 0
+        if deleted:
+            logger.info(f"已清理 {days} 天前的孤儿草稿 {deleted} 条")
+        return deleted
+
+    def update_article_html(self, article_id: int, html: str):
+        """回写最终 HTML（图片占位符已解析为 CDN 外链的成品），实现「所见即所存」
+
+        库里原本只存 content（Markdown 正文），而真正发出去的是解析后的
+        formatted_html；不回写会导致无法审计/重发实际发布的内容。
+        """
+        if not html:
+            return
+        conn = self._get_conn()
+        conn.execute("UPDATE articles SET html=? WHERE id=?", (html, article_id))
+        conn.commit()
+        logger.info(f"最终 HTML 已回写落库: id={article_id} ({len(html)} 字符)")
+
     def save_review_log(
         self,
         article_id: int,
@@ -185,14 +226,52 @@ class ContentDB:
             if (created := _parse_dt(row[1])) is not None and created >= cutoff
         ]
 
-    def get_article_count(self, days: int = 7) -> int:
+    def get_recent_articles_for_dedup(self, days: int = 30) -> list[dict[str, str]]:
+        """获取最近 N 天的 {title, topic} 列表（选题去重用）
+
+        与 get_recent_titles 的区别：同时返回 topic 列。选题 Agent 需要对
+        「标题」与「选题」两个字段都做相似度比对 —— 只比对标题会漏掉
+        「标题不同但选题相同」的重复，只比对 topic 会漏掉改了选题措辞的重写。
+
+        不修改 get_recent_titles 的返回类型：hermes/agent.py 依赖其 list[str] 契约。
+        articles.topic 列在建表时即存在，无需 schema 迁移。
+        """
+        cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat()
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT title, topic, created_at FROM articles "
+            "WHERE created_at >= ? ORDER BY created_at DESC",
+            (cutoff_iso,),
+        ).fetchall()
+        # 与 get_recent_titles 一致：兜底修正含时区导致字典序偏差的行
+        cutoff = datetime.fromisoformat(cutoff_iso)
+        return [
+            {"title": row[0] or "", "topic": row[1] or ""}
+            for row in rows
+            if (created := _parse_dt(row[2])) is not None and created >= cutoff
+        ]
+
+    def get_article_count(self, days: int = 7, status: str | None = None) -> int:
         """获取最近 N 天的文章数量
 
+        Args:
+            days: 统计窗口天数
+            status: 可选状态过滤（如 "published" = 只统计已发表）。
+                None = 统计全部行（含未发表的草稿/失败运行）。
+
         计数下推到 SQL（WHERE created_at >= ?），避免拉全表后在 Python 端统计。
+
+        注意：调度器的「每日发布上限」必须用 status="published" 调用，
+        否则失败/草稿运行会占用配额，导致当天后续定时任务被静默跳过。
         """
         cutoff_iso = (datetime.now() - timedelta(days=days)).isoformat()
         conn = self._get_conn()
         # COUNT 直接由 SQLite 在索引上完成，无需把每行 created_at 拉回 Python。
+        if status:
+            return conn.execute(
+                "SELECT COUNT(*) FROM articles WHERE created_at >= ? AND status = ?",
+                (cutoff_iso, status),
+            ).fetchone()[0]
         return conn.execute(
             "SELECT COUNT(*) FROM articles WHERE created_at >= ?",
             (cutoff_iso,),

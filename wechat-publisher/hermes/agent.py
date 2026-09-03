@@ -446,6 +446,13 @@ class HermesAgent:
                 self._workflow_status["running"] = False
                 self._workflow_status["last_result"] = dict(result) if result else {}
                 self._workflow_status["last_run_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                # 选题降级中止时后续节点不会执行，进度会永久停在 pending，
+                # 状态卡片一直显示「等待中」；这里统一置为 skipped。
+                if (result.get("metadata") or {}).get("topic_degraded"):
+                    self._workflow_status["progress"] = {
+                        node: ("skipped" if status == "pending" else status)
+                        for node, status in self._workflow_status["progress"].items()
+                    }
 
             # 发送结果卡片
             publish_result = result.get("publish_result", {}) if result else {}

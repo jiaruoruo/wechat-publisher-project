@@ -10,11 +10,15 @@ from config.paths import BASE_DIR
 if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
-from models.llm_router import load_config
+from models.llm_router import load_config, LLMRouter
 from graph.workflow import ArticleWorkflow
+from agents.topic_planner import TopicPlannerAgent
 from browser.wechat_session import WechatSession
 from browser.screenshot_utils import cleanup_old_screenshots
 from browser.wechat_selectors import validate_selectors_config
+from browser.selector_ledger import cleanup_old_stats
+from config.paths import SELECTOR_STATS_DIR
+from tools.content_db import ContentDB
 from scheduler import start_scheduler, run_workflow
 from config.validation import validate_config
 
@@ -49,6 +53,38 @@ def cmd_run(args):
         print(f"\n发布成功！模式: {publish_result.get('mode', 'draft')}")
     else:
         print(f"\n发布失败: {publish_result.get('error', '未知错误')}")
+
+
+def cmd_topics(args):
+    """产出候选选题清单供人工审核（只读：不写库、不发布、不生成正文）"""
+    config = load_config()
+    router = LLMRouter(config)
+    agent = TopicPlannerAgent(router, config)
+
+    count = getattr(args, "count", 12) or 12
+    topics = agent.suggest_topics(count=count)
+
+    if not topics:
+        print("\n候选选题产出为空（可能因搜索服务或 LLM 异常）。可稍后重试。")
+        return
+
+    print(f"\n=== 候选选题（共 {len(topics)} 个，覆盖 AI/机器人/芯片，国内/国际混合）===")
+    for i, t in enumerate(topics, 1):
+        direction = t.get("direction", "")
+        region = t.get("region", "")
+        confidence = t.get("confidence", "medium")
+        tag = f"[{direction}/{region}] 可信度:{confidence}"
+        print(f"\n{i}. {t.get('title', '')}  {tag}")
+        angle = t.get("angle", "")
+        if angle:
+            print(f"   角度: {angle}")
+        why = t.get("why", "")
+        if why:
+            print(f"   为什么写: {why}")
+        evidence = t.get("evidence", "")
+        if evidence:
+            print(f"   依据: {evidence}")
+    print("\n请回复编号选择，或给出你自己的选题（用 run --topic 执行，当前为 draft 模式不群发）。")
 
 
 def cmd_login(args):
@@ -142,6 +178,27 @@ def cmd_check(args):
         except Exception as e:
             print(f"  截图保留清理失败: {e}")
 
+        # 台账保留清理（selector_stats 按日期归档，长期运行会按天堆积）
+        try:
+            removed_stats = cleanup_old_stats(SELECTOR_STATS_DIR, retention)
+            if removed_stats:
+                print(f"  台账保留清理: 删除 {removed_stats} 个过期日期文件（保留 {retention} 天）")
+            else:
+                print("  台账保留清理: 无需清理")
+        except Exception as e:
+            print(f"  台账保留清理失败: {e}")
+
+        # 孤儿草稿清理（发布失败/中断残留的 draft 行，干扰统计与选题去重）
+        try:
+            with ContentDB(config.get("storage", {}).get("db_path")) as _db:
+                removed_drafts = _db.delete_orphan_drafts(days=7)
+            if removed_drafts:
+                print(f"  孤儿草稿清理: 删除 7 天前仍未发表的草稿 {removed_drafts} 条")
+            else:
+                print("  孤儿草稿清理: 无需清理")
+        except Exception as e:
+            print(f"  孤儿草稿清理失败: {e}")
+
         # 检查飞书配置
         feishu = config.get("feishu", {})
         feishu_status = "已配置" if feishu.get("app_id") else "未配置"
@@ -225,6 +282,10 @@ def main():
     run_parser.add_argument("--topic", type=str, help="指定选题（可选）")
     run_parser.add_argument("--title", type=str, help="指定标题（可选）")
 
+    # topics 命令（候选选题清单，只读不发布）
+    topics_parser = subparsers.add_parser("topics", help="产出候选选题清单供审核（不写库、不发布）")
+    topics_parser.add_argument("--count", type=int, default=12, help="候选数量（默认 12，实际 10~15）")
+
     # login 命令
     login_parser = subparsers.add_parser("login", help="交互式登录公众号")
     login_parser.add_argument("--timeout", type=int, default=120, help="登录超时时间（秒）")
@@ -256,6 +317,7 @@ def main():
     # 分发命令
     commands = {
         "run": cmd_run,
+        "topics": cmd_topics,
         "login": cmd_login,
         "schedule": cmd_schedule,
         "check": cmd_check,

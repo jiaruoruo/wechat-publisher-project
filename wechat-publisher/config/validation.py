@@ -24,6 +24,67 @@ PROVIDER_ENV_MAP = {
     "dashscope": "DASHSCOPE_API_KEY",
 }
 
+# content.topic_planning 整数参数 -> (下界, 上界)
+# 单一来源：config/validation.py 用它做 warning 提示，agents/topic_planner.py
+# 导入它做实际钳制，避免两处阈值各自漂移。
+# 上界是成本/耗时守卫，不只是格式约束：如 max_keywords=999 会真的发出 999 次请求。
+TOPIC_PLANNING_INT_RULES: dict[str, tuple[int, int]] = {
+    "history_days": (1, 365),
+    "history_limit": (1, 100),
+    "max_keywords": (1, 10),
+    "results_per_keyword": (1, 10),
+    "max_topic_attempts": (1, 5),
+    "llm_max_attempts": (1, 5),
+}
+
+
+def _validate_topic_planning(planning: Any) -> list[tuple[str, str]]:
+    """校验 content.topic_planning（全部为 warning 级，不影响可运行性）"""
+    issues: list[tuple[str, str]] = []
+
+    if not isinstance(planning, dict):
+        issues.append((
+            "warning",
+            f"content.topic_planning 必须是映射（key-value），当前值 {planning!r} 将被忽略并回落默认值",
+        ))
+        return issues
+
+    for key, (low, high) in TOPIC_PLANNING_INT_RULES.items():
+        if key not in planning:
+            continue
+        value = planning[key]
+        # bool 是 int 的子类，需显式排除，避免 `true` 被当成 1
+        if isinstance(value, bool) or not isinstance(value, int) or not (low <= value <= high):
+            issues.append((
+                "warning",
+                f"content.topic_planning.{key} 必须是 {low}~{high} 的整数，"
+                f"当前值 {value!r} 将回落默认",
+            ))
+
+    threshold = planning.get("dedup_threshold")
+    if threshold is not None and (
+        isinstance(threshold, bool)
+        or not isinstance(threshold, (int, float))
+        or not (0 < threshold <= 1)
+    ):
+        issues.append((
+            "warning",
+            f"content.topic_planning.dedup_threshold 必须落在 (0, 1]，"
+            f"当前值 {threshold!r} 将回落默认 0.82",
+        ))
+
+    ttl = planning.get("trending_cache_ttl_seconds")
+    if ttl is not None and (
+        isinstance(ttl, bool) or not isinstance(ttl, int) or ttl < 0
+    ):
+        issues.append((
+            "warning",
+            f"content.topic_planning.trending_cache_ttl_seconds 必须是非负整数"
+            f"（0 = 不缓存），当前值 {ttl!r} 将回落默认",
+        ))
+
+    return issues
+
 
 def validate_config(config: dict | None) -> list[tuple[str, str]]:
     """校验配置，返回 (severity, message) 列表
@@ -100,6 +161,10 @@ def validate_config(config: dict | None) -> list[tuple[str, str]]:
     content = config.get("content", {})
     if not content.get("domain"):
         issues.append(("error", "内容领域未配置（content.domain）"))
+
+    # 未配置该段时不校验（保持与旧配置兼容，缺失即全部走默认值）
+    if "topic_planning" in content:
+        issues.extend(_validate_topic_planning(content["topic_planning"]))
 
     # ── 审核（重试成本守卫）───────────────────────────────────
     review = config.get("review", {})

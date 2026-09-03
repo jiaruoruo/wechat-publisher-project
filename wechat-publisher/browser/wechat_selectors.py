@@ -72,8 +72,11 @@ DEFAULT_SELECTORS: dict = {
         '[contenteditable="true"]',
     ],
     "content_verify_editor": '[contenteditable="true"], .edui-body-container, .ProseMirror',
-    # 封面区域
+    # 封面区域（新版编辑器：右侧设置区按钮 .js_cover_btn_area，点击后弹出操作菜单）
     "cover_area": [
+        ".js_cover_btn_area",
+        ".select-cover__btn",
+        ".setting-group__cover_area",
         ".js_cover_area",
         ".cover_area",
         ".cover-panel",
@@ -83,15 +86,14 @@ DEFAULT_SELECTORS: dict = {
         "text=封面",
     ],
     "cover_select_from_body": [
+        ".js_selectCoverFromContent",
         "text=从正文选择",
         'button:has-text("从正文选择")',
         'a:has-text("从正文选择")',
         'li:has-text("从正文选择")',
         'label:has-text("从正文选择")',
         "text=从正文中选择",
-        'div:has-text("从正文")',
         '[class*="choose"]:has-text("正文")',
-        "text=正文",  # 最后兜底
     ],
     "cover_body_first_image": [
         ".cover-body-img",
@@ -101,8 +103,10 @@ DEFAULT_SELECTORS: dict = {
         ".weui-desktop-radio-group img",
     ],
     "cover_preview": ".cover_preview, .js_cover_preview",
-    # 封面上传（文件方式）
+    # 封面上传（文件方式）；新版编辑器的 input 在封面弹窗内且隐藏，
+    # upload_cover_image 会先点封面区域展开弹窗再直接 set_input_files
     "cover_file_inputs": [
+        'input[type="file"][name="file"][accept*="image"]',
         'input[type="file"][accept*="image"]',
         '.cover-upload input[type="file"]',
         '.weui-desktop-form__upload input[type="file"]',
@@ -131,8 +135,26 @@ DEFAULT_SELECTORS: dict = {
         'button:has-text("发表")',
     ],
     # 通用
-    "confirm_button": 'button:has-text("确定")',
+    "confirm_button": 'button:has-text("确定"), button:has-text("确认")',
     "toast": ".weui-desktop-toast, .weui-toast",
+    # 发布结果验证（publish_actions 的 _wait_publish_outcome / verify_published_online 用）
+    # 页面成功提示文本（命中任一即视为发布成功信号）
+    "publish_success_texts": ["发表成功", "发布成功", "群发成功", "提交成功"],
+    # 表单校验/发送失败提示文本（命中任一即提前判定发布被拦截）
+    "publish_fail_texts": ["不能为空", "请先上传封面", "必须插入一张图片", "发送失败", "发表失败", "群发失败"],
+    # 后台侧边栏「发表记录」入口（复核路线 2）
+    "published_list_entries": [
+        'a:has-text("发表记录")',
+        '.new-creation__menu-title:has-text("发表记录")',
+        'a:has-text("已发表")',
+        'a:has-text("草稿箱")',
+    ],
+    # 「草稿箱/发表记录」页内切换到已发表列表的标签
+    "published_tab": [
+        '.weui-desktop-tab__title:has-text("已发表")',
+        'a:has-text("已发表")',
+        "text=已发表",
+    ],
     # 已登录后台的特征选择器（check_login 用；编辑器改版时一处维护）
     "login_indicators": [
         ".weui-desktop-panel",

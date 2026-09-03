@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -104,6 +105,7 @@ class TestParseUploadResponse(unittest.TestCase):
 class TestResolveImagePlaceholders(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
         self.img1 = os.path.join(self.tmp, "a.png")
         self.img2 = os.path.join(self.tmp, "b.png")
         for p in (self.img1, self.img2):

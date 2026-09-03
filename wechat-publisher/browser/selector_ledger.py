@@ -35,6 +35,38 @@ def serialize(report: dict, now: datetime | None = None) -> str:
     return json.dumps({"ts": ts, **report}, ensure_ascii=False)
 
 
+def cleanup_old_stats(directory: str, retention_days: int = 30) -> int:
+    """删除过期台账：按日期归档天然分片，只需按保留期回收旧 {YYYYMMDD}.jsonl
+
+    Args:
+        directory: 台账目录（storage/selector_stats）
+        retention_days: 保留天数；<=0 表示不清理
+
+    Returns:
+        删除的文件数
+    """
+    if retention_days <= 0 or not os.path.isdir(directory):
+        return 0
+    cutoff = (datetime.now() - timedelta(days=retention_days)).strftime("%Y%m%d")
+    removed = 0
+    for name in os.listdir(directory):
+        if not (name.endswith(".jsonl") and len(name) == 13):
+            continue
+        day = name[:-6]
+        if not day.isdigit():
+            continue
+        # 文件名即日期，字典序比较等价于时间比较
+        if day < cutoff:
+            try:
+                os.remove(os.path.join(directory, name))
+                removed += 1
+            except OSError as e:
+                logger.warning(f"清理过期台账失败 {name}: {e}")
+    if removed:
+        logger.info(f"已清理 {retention_days} 天前的台账 {removed} 个文件（保留 {retention_days} 天）")
+    return removed
+
+
 def parse_line(line: str) -> dict | None:
     """解析 JSONL 一行；空行/损坏行/非对象返回 None"""
     line = line.strip()

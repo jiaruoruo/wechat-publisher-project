@@ -7,6 +7,7 @@
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -37,7 +38,9 @@ class ScreenshotPathTest(unittest.TestCase):
             )
 
     def test_directory_auto_created(self):
-        base = os.path.join(tempfile.mkdtemp(), "not", "exists", "shots")
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        base = os.path.join(tmp, "not", "exists", "shots")
         path = screenshot_path(base, "a")
         self.assertTrue(os.path.isdir(os.path.dirname(path)))
         self.assertTrue(os.path.isdir(base))
@@ -105,8 +108,10 @@ class CleanupOldScreenshotsTest(unittest.TestCase):
             self.assertTrue(os.path.exists(new_path))
 
     def test_missing_dir_returns_zero(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
         self.assertEqual(
-            cleanup_old_screenshots(os.path.join(tempfile.mkdtemp(), "nope"), 30), 0
+            cleanup_old_screenshots(os.path.join(tmp, "nope"), 30), 0
         )
 
     def test_invalid_retention_config_safe(self):

@@ -88,8 +88,9 @@ class ImageGenerator:
         if api_key:
             dashscope.api_key = api_key
 
-        # 转换尺寸格式
-        width, height = size.split("x")
+        # 转换尺寸格式：closest_size 对 dashscope 返回 "1280*720"（星号分隔），
+        # 需先统一为 "x" 再拆分，否则 split("x") 会得到单元素列表而解包失败
+        width, height = size.replace("*", "x").split("x")
         rsp = ImageSynthesis.call(
             model=self.model,
             prompt=prompt,

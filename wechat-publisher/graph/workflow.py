@@ -1,12 +1,15 @@
 """LangGraph 主工作流定义 - 编排所有 Agent 的协作流程"""
 
+import os
+import json
 import logging
 from collections.abc import Callable
+from datetime import datetime
 
 from langgraph.graph import StateGraph, START, END
 
 from graph.state import ArticleState, create_initial_state, CHANNEL_REDUCERS
-from graph.conditions import review_condition, increment_retry
+from graph.conditions import review_condition, increment_retry, topic_condition
 from models.llm_router import LLMRouter, load_config
 from agents.topic_planner import TopicPlannerAgent
 from agents.content_writer import ContentWriterAgent
@@ -91,7 +94,15 @@ class ArticleWorkflow:
 
         # 添加边
         workflow.add_edge(START, "topic_planner")
-        workflow.add_edge("topic_planner", "content_writer")
+        # 选题闸门：降级时直连 END，不进入后续节点
+        workflow.add_conditional_edges(
+            "topic_planner",
+            topic_condition,
+            {
+                "continue": "content_writer",
+                "aborted": END,
+            },
+        )
         workflow.add_edge("content_writer", "image_generator")
         workflow.add_edge("image_generator", "reviewer")
 
@@ -202,6 +213,27 @@ class ArticleWorkflow:
         else:
             final_state = self.app.invoke(state, config=run_config)
 
+        # 选题降级中止：补齐 publish_result 并跳过落库。
+        # publisher 节点未执行，publish_result 仍是 create_initial_state 的 {}；
+        # 这里统一填充，保证三个入口读到一致的失败原因。
+        if (final_state.get("metadata") or {}).get("topic_degraded"):
+            reason = final_state["metadata"].get("topic_degraded_reason", "选题降级")
+            logger.warning(f"选题降级，已中止后续流程: {reason}")
+            final_state["publish_result"] = {
+                "success": False,
+                "mode": self.config.get("wechat", {}).get("publish_mode", "draft"),
+                "error": f"选题阶段中止：{reason}",
+            }
+            # 仍记录一条完成事件，保证中止在结构化日志里可见（否则该次运行完全无痕）
+            workflow_event(
+                "complete",
+                article_title=final_state.get("article_title", "N/A"),
+                score=None,
+                retries=0,
+                success=False,
+            )
+            return final_state
+
         # 工作流完成后保存到数据库
         self._save_result(final_state)
 
@@ -231,7 +263,23 @@ class ArticleWorkflow:
         return final_state
 
     def _save_result(self, state: ArticleState):
-        """保存文章结果到数据库"""
+        """保存文章结果到数据库
+
+        各步骤独立 try：正文落库失败不应阻断「已发表」状态与最终 HTML 的回写，
+        避免出现「微信端已发表、但库里仍是 draft」的状态不一致。
+
+        选题降级中止时直接跳过：空 content 的草稿会污染 get_recent_articles_for_dedup
+        的去重比对，也会让 get_article_count 虚高进而吃满每日发布配额。
+        """
+        if (state.get("metadata") or {}).get("topic_degraded"):
+            logger.warning(
+                "选题降级已中止流程，跳过落库（避免空草稿污染去重比对与配额统计）"
+            )
+            return
+
+        article_id = None
+
+        # 1) 正文落库
         try:
             # review_history 已提升为顶层通道（schema 归并），落库时重新嵌入
             # articles.metadata，保持与旧版（review_history 嵌在 metadata 内）一致的记录形态
@@ -246,27 +294,90 @@ class ArticleWorkflow:
                 content=state.get("content", ""),
                 metadata=metadata,
             )
+            logger.info(f"文章已保存到数据库: id={article_id}")
+        except Exception as e:
+            logger.error(f"保存文章正文到数据库失败: {e}")
 
-            # 更新发布状态
-            publish_result = state.get("publish_result", {})
-            if publish_result.get("success"):
+        if article_id is None:
+            self._audit_publish(None, state, ok=False, note="正文落库失败，未获得 article_id")
+            return
+
+        publish_result = state.get("publish_result", {})
+        db_ok = True
+
+        # 2) 更新发布状态（同时写入发表后的文章链接）
+        if publish_result.get("success"):
+            status = "published" if publish_result.get("mode") == "publish" else "draft"
+            try:
                 self.db.update_article_status(
-                    article_id,
-                    "published" if publish_result.get("mode") == "publish" else "draft",
+                    article_id, status, publish_result.get("url", "")
                 )
+            except Exception as e:
+                db_ok = False
+                logger.error(f"更新文章发布状态失败: {e}")
 
-            # 保存审核记录
-            review_result = state.get("review_result", {})
-            if review_result:
+        # 3) 回写最终 HTML（占位符已解析为 CDN 外链的成品），实现「所见即所存」
+        final_html = publish_result.get("final_html", "")
+        if final_html:
+            try:
+                self.db.update_article_html(article_id, final_html)
+            except Exception as e:
+                logger.error(f"回写最终 HTML 失败: {e}")
+
+        # 4) 保存审核记录
+        review_result = state.get("review_result", {})
+        if review_result:
+            try:
                 self.db.save_review_log(
                     article_id,
                     review_result,
                     state.get("retry_count", 0),
                 )
+            except Exception as e:
+                logger.error(f"保存审核记录失败: {e}")
 
-            logger.info(f"文章已保存到数据库: id={article_id}")
+        # 5) 发布成功时留审计痕（落库失败时尤为关键）
+        if publish_result.get("success"):
+            self._audit_publish(article_id, state, ok=db_ok)
+
+    def _audit_publish(
+        self,
+        article_id: int | None,
+        state: ArticleState,
+        ok: bool,
+        note: str = "",
+    ):
+        """发布结果审计：DB 落库失败时仍有独立文件留痕
+
+        避免「微信端已发表、但数据库未记录」且无任何可追溯线索的情况。
+        """
+        publish_result = state.get("publish_result", {})
+        record = {
+            "ts": datetime.now().isoformat(),
+            "article_id": article_id,
+            "title": state.get("article_title", ""),
+            "success": publish_result.get("success", False),
+            "mode": publish_result.get("mode", ""),
+            "url": publish_result.get("url", ""),
+            "error": publish_result.get("error", ""),
+            "db_ok": ok,
+            "note": note,
+        }
+        try:
+            path = os.path.join(os.path.dirname(self.db.db_path), "publish_audit.log")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except Exception as e:
-            logger.error(f"保存文章到数据库失败: {e}")
+            logger.error(f"发布审计日志写入失败: {e}")
+
+        if not ok:
+            logger.error(
+                f"【发布结果落库失败】article_id={article_id} "
+                f"title={state.get('article_title', '')[:30]} "
+                f"success={publish_result.get('success')} "
+                f"url={publish_result.get('url', '')} note={note} "
+                f"—— 请检查数据库，已写入 publish_audit.log"
+            )
 
     def _log_summary(self, state: ArticleState):
         """输出工作流执行摘要"""

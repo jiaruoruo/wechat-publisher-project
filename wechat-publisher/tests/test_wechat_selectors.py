@@ -9,6 +9,7 @@
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -170,6 +171,7 @@ class ValidateSelectorsConfigTest(unittest.TestCase):
 
     def _write(self, content, suffix=".yaml"):
         d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
         path = os.path.join(d, "selectors" + suffix)
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)

@@ -11,6 +11,7 @@
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -38,6 +39,7 @@ if DEPS_AVAILABLE:
     import agents.publisher as pub_mod
     from models.llm_router import load_config
     from graph.workflow import ArticleWorkflow
+    from tools.content_db import ContentDB
 
 
 # ── 桩组件 ─────────────────────────────────────────────
@@ -111,7 +113,12 @@ class Scenario:
 
 
 def _install_stubs() -> tuple[dict, dict]:
-    """安装桩：LLM、图片生成、网络搜索、浏览器/发布"""
+    """安装桩：LLM、图片生成、网络搜索、浏览器/发布
+
+    所有替换都经 _patch_attr 登记，由 tearDownModule 统一还原。
+    此前是直接赋值，桩会永久停留在模块上并泄漏给同进程内后跑的其他测试模块
+    （如 test_web_search 因此拿到的是桩而非真实实现）。
+    """
     llms: dict[str, FakeLLM] = {}
     holder: dict = {"responder": None}
 
@@ -120,13 +127,28 @@ def _install_stubs() -> tuple[dict, dict]:
             llms[agent_name] = FakeLLM(agent_name, holder)
         return llms[agent_name]
 
-    lr_mod.LLMRouter.get_llm = fake_get_llm
+    _patch_attr(lr_mod.LLMRouter, "get_llm", fake_get_llm)
 
     def fake_generate(self, prompt: str, size: str = "", output_name: str | None = None):
         return os.path.join("storage", "images", f"{output_name or 'img'}.png")
 
-    im_mod.ImageGenerator.generate = fake_generate
-    ws_mod.search_trending = lambda keywords, domain="": "热点摘要：AI 大模型最新进展。"
+    _patch_attr(im_mod.ImageGenerator, "generate", fake_generate)
+    # 选题 Agent 走 search_trending_detailed（模块属性调用，可被桩替换）
+    _patch_attr(
+        ws_mod,
+        "search_trending_detailed",
+        lambda keywords, domain="", **kwargs: {
+            "text": "热点摘要：AI 大模型最新进展。",
+            "sources": ["https://example.com/ai"],
+            "ok": True,
+        },
+    )
+    # 保留旧桩：确认 search_trending 的 str 契约未被破坏
+    _patch_attr(
+        ws_mod,
+        "search_trending",
+        lambda keywords, domain="": "热点摘要：AI 大模型最新进展。",
+    )
 
     class StubSession:
         def __init__(self, config):
@@ -148,24 +170,59 @@ def _install_stubs() -> tuple[dict, dict]:
             pass
 
     class StubActions:
-        def __init__(self, page, config):
+        # 生产代码以 PublishActions(page, config, session=session) 调用；
+        # 桩必须兼容该签名，否则 publisher 捕获 TypeError 后会把成功发布误报为失败。
+        def __init__(self, page, config, session=None):
             pass
 
         def execute_publish(self, **kwargs):
             return {"success": True, "mode": "draft", "preview_path": "", "error": ""}
 
-    pub_mod.WechatSession = StubSession
-    pub_mod.PublishActions = StubActions
+    _patch_attr(pub_mod, "WechatSession", StubSession)
+    _patch_attr(pub_mod, "PublishActions", StubActions)
 
     return llms, holder
 
 
+# 被 _install_stubs 替换掉的模块属性原值，供 tearDownModule 统一还原
+_PATCHED_ATTRS: list[tuple[object, str, object]] = []
+
+
+def _patch_attr(target, name: str, value):
+    """替换模块/类属性并登记原值（只登记首次，避免多次 setUpClass 覆盖原值）"""
+    for entry in _PATCHED_ATTRS:
+        if entry[0] is target and entry[1] == name:
+            break
+    else:
+        _PATCHED_ATTRS.append((target, name, getattr(target, name)))
+    setattr(target, name, value)
+
+
+# 测试期间创建的临时目录，由 tearDownModule 统一清理（避免在项目根目录堆积 tmp*）
+_TMPDIRS: list[str] = []
+
+
 def _make_config(max_retries: int = 2) -> dict:
+    """构造测试用 config；db 落在临时目录，登记后由 tearDownModule 统一清理"""
     config = load_config()
-    config.setdefault("storage", {})["db_path"] = os.path.join(tempfile.mkdtemp(), "e2e.db")
+    tmpdir = tempfile.mkdtemp()
+    _TMPDIRS.append(tmpdir)
+    config.setdefault("storage", {})["db_path"] = os.path.join(tmpdir, "e2e.db")
     config.setdefault("notification", {})["enabled"] = False
     config.setdefault("review", {})["max_retries"] = max_retries
     return config
+
+
+def tearDownModule():
+    """还原被打桩的模块属性 + 清理测试期间创建的临时目录
+
+    还原必须做：否则桩会泄漏给同进程内随后执行的其他测试模块。
+    """
+    while _PATCHED_ATTRS:
+        target, name, original = _PATCHED_ATTRS.pop()
+        setattr(target, name, original)
+    while _TMPDIRS:
+        shutil.rmtree(_TMPDIRS.pop(), True)
 
 
 # ── 测试用例 ───────────────────────────────────────────
@@ -325,6 +382,70 @@ class TestJsonMode(unittest.TestCase):
         # 非 JSON 契约的 agent 不应请求
         self.assertFalse(self.llms["content_writer"].json_mode_requested)
         self.assertFalse(self.llms["formatter"].json_mode_requested)
+
+
+@unittest.skipUnless(DEPS_AVAILABLE, "需要 langgraph 等运行时依赖")
+class TestTopicDegradation(unittest.TestCase):
+    """选题降级必须短路：后续节点不执行、不发布、不落空记录"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.llms, cls.holder = _install_stubs()
+
+    def _run_degraded(self, use_callback=True):
+        def responder(agent_name, prompt):
+            if agent_name == "topic_planner":
+                return "这不是 JSON，只是一段闲聊"
+            raise AssertionError(f"{agent_name} 不应在选题降级后被执行")
+
+        self.holder["responder"] = responder
+        config = _make_config()
+        order = []
+        workflow = ArticleWorkflow(config)
+        result = workflow.run(
+            progress_callback=(lambda n, s: order.append(n)) if use_callback else None,
+        )
+        return result, order, config
+
+    def test_degraded_aborts_pipeline_and_reports_failure(self):
+        result, order, _ = self._run_degraded()
+
+        self.assertTrue(result["metadata"]["topic_degraded"])
+        self.assertIn("缺少必需字段", result["metadata"]["topic_degraded_reason"])
+        # 只有选题节点执行过，后续节点全部短路
+        self.assertEqual(order, ["topic_planner"])
+        # publish_result 必须给出明确失败原因，而不是空的 {}
+        self.assertFalse(result["publish_result"]["success"])
+        self.assertIn("选题阶段中止", result["publish_result"]["error"])
+
+    def test_degraded_abort_invoke_path(self):
+        result, _, _ = self._run_degraded(use_callback=False)
+
+        self.assertTrue(result["metadata"]["topic_degraded"])
+        self.assertFalse(result["publish_result"]["success"])
+
+    def test_degraded_writes_nothing_to_db(self):
+        # 空 content 的草稿会污染去重比对与每日配额统计
+        _, _, config = self._run_degraded()
+
+        db = ContentDB(config["storage"]["db_path"])
+        try:
+            self.assertEqual(len(db.get_recent_articles_for_dedup(days=3650)), 0)
+        finally:
+            db.close()
+
+    def test_normal_path_still_runs_full_pipeline(self):
+        # 对照：未降级时流水线照常跑完，确认闸门没有误伤正常路径
+        scenario = Scenario([True])
+        self.holder["responder"] = scenario.responder
+        order = []
+        result = ArticleWorkflow(_make_config()).run(
+            progress_callback=lambda n, s: order.append(n),
+        )
+
+        self.assertFalse(result["metadata"].get("topic_degraded", False))
+        self.assertEqual(order[-2:], ["formatter", "publisher"])
+        self.assertTrue(result["publish_result"]["success"])
 
 
 if __name__ == "__main__":

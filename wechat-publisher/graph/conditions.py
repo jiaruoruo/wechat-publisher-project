@@ -24,6 +24,24 @@ def review_condition(state: ArticleState) -> str:
     return "rejected"
 
 
+def topic_condition(state: ArticleState) -> str:
+    """
+    选题阶段闸门：选题降级时短路，跳过后续所有节点
+
+    选题是流水线的第一环，一旦降级（LLM 调用连续失败或输出缺少必需字段），
+    后续节点只会在占位内容上白跑一遍生成/配图/审核/发布，还会占用每日发布配额。
+    这里让 topic_planner 始终正常返回、只把 topic_degraded 写进 metadata，
+    由本函数统一判定，保证 CLI / scheduler / Hermes 三个入口行为一致。
+
+    Returns:
+        "continue" - 选题正常，进入内容创作
+        "aborted"  - 选题降级，直连 END
+    """
+    if (state.get("metadata") or {}).get("topic_degraded"):
+        return "aborted"
+    return "continue"
+
+
 def increment_retry(state: ArticleState) -> dict:
     """重试计数节点：每次审核 rejected 后自增 retry_count
 
