@@ -1,0 +1,162 @@
+# 微信公众号自动发布系统 - 配置模板
+#
+# 使用方式：
+#   1. 复制本文件为 config/settings.yaml（该文件已被 .gitignore 忽略，不会进版本库）
+#   2. 不要在本文件里填任何密钥 —— 用环境变量提供，避免明文进本机配置：
+#        DEEPSEEK_API_KEY     （deepseek 模型）
+#        OPENAI_API_KEY       （openai 模型）
+#        DASHSCOPE_API_KEY    （dashscope 图片生成）
+#      PowerShell 设置用户级环境变量（新开终端生效）：
+#        [Environment]::SetEnvironmentVariable('DEEPSEEK_API_KEY','<你的key>','User')
+#   3. 校验：python main.py check
+#
+# 说明：环境变量优先级高于本文件（见 models/llm_router.py 的 key 解析顺序），
+#       因此下面所有 api_keys 保持空串即可。
+
+# 公众号基本信息
+wechat:
+  account_name: "赛博硅基"  # 公众号名称（备查；代码未引用，日志标识用）
+  # 公众号「功能介绍」文案，备查用（代码未引用，需人工到公众号后台粘贴）
+  # 微信功能介绍上限约 120 字，修改时需校验长度
+  account_intro: "赛博硅基 · 用人话讲清楚 AI、机器人与芯片。关注大模型、具身智能、半导体与算力，把硬核技术讲成人话，把产业动态看出门道。写给想真正看懂技术的人。"
+  publish_mode: "draft"  # "draft" = 仅保存草稿, "publish" = 直接群发（默认 draft 防误触群发）
+  external_images: true  # true = 文内图片上传微信 CDN 外链（逐张失败自动回退 base64，已成功的 CDN URL 保留）；false = 始终 base64 内嵌
+  cover_in_body: true  # true = 封面 CDN URL 作为正文首图注入并通过「从正文选择」设为封面；false = 封面仍走 CDN 上传拿 URL，但设置封面走旧的文件上传（正文不以封面开头）
+  selectors_file: ""  # 可选：自定义编辑器选择器 YAML/JSON 文件路径（默认 config/selectors.yaml，编辑器改版时只需改该文件）；也可用环境变量 WECHAT_SELECTORS_FILE 覆盖，优先级更高
+  publish_lock_timeout: 30  # 发布互斥锁等待秒数：锁被其他进程占用时最多等待这么久，超时才跳过本次执行（0 = 立即跳过）
+
+# 内容配置
+content:
+  # 保持「科技」而非「人工智能」：该值会拼进搜索查询 f"{domain} {kw} 最新"
+  # 与选题 prompt，若改成「人工智能」会与下方关键词拼出「人工智能 人工智能 最新」
+  domain: "科技"  # 内容领域
+  # 覆盖 AI / 机器人 / 芯片 三大主题。
+  # 注意：这三者互不同义，不会被 web_search 的同义词归合并掉，
+  # 因此正好用满 max_keywords=3（写「AI」+「人工智能」会被合并，实际只剩 2 个查询）
+  keywords:
+    - "人工智能"
+    - "机器人"
+    - "芯片"
+  article_length:  # 目标字数范围
+    min: 1500
+    max: 3000
+  # 内容风格：会被注入选题 prompt（topic_planner）与正文 prompt（content_writer）
+  # 写成可执行的写作指令，而非形容词堆砌
+  style: "面向大众读者的科技观察者口吻：专业但不掉书袋，遇到芯片、模型、机器人等术语先用一句人话解释清楚再展开；多用具体案例、数字和类比，少用形容词和空话；语气克制冷静，不吹不黑，兼顾技术判断与产业视角；避免标题党与制造焦虑。"
+  template: "simple"  # 排版模板: simple / business / lively
+
+  # 选题策划参数（全部可选）
+  # 缺省、类型非法或越界时一律静默回落默认值并记一条 warning，不会中断运行
+  topic_planning:
+    history_days: 30            # 去重与提示词参考的历史文章窗口（天），1~365
+    history_limit: 10           # 送入提示词/参与比对的历史文章最大条数，1~100
+    max_keywords: 3             # 参与热点搜索的关键词数量上限，1~10
+    results_per_keyword: 3      # 每个关键词保留的搜索结果条数，1~10
+    dedup_threshold: 0.82       # 选题去重相似度阈值，落在 (0, 1]，越大越严格
+    skip_search_when_specified: true  # true = 调用方指定选题（run --topic）时跳过热点搜索，省 3 次网络请求
+    trending_cache_ttl_seconds: 3600  # 热点搜索结果缓存秒数，0 = 不缓存
+    max_topic_attempts: 2       # 选题最大尝试次数（含首次）：2 = 重复时最多再重选 1 次，1~5
+    llm_max_attempts: 2         # 单次选题 LLM 调用的最大尝试次数（1 次重试），1~5
+    # ── 搜索查询构造 ──
+    query_suffixes:               # 后缀候选链：单一后缀无全局最优，按序尝试
+      - "最新消息"
+      - "行业动态"
+      - "新闻"
+    include_domain_in_query: false  # false = 不拼 domain 前缀（实测加「科技」会劣化结果）
+    max_query_variants: 2         # 单关键词最多尝试的后缀数（含首轮），防止请求爆炸
+    filter_aggregator_pages: true # true = 过滤「资讯/日报/导航」等聚合页，避免抹平关键词差异
+
+# 模型配置
+# 成本优化：reviewer/formatter/publisher/image_generator 属于确定性任务，
+# 可切换更便宜的模型（如 provider: deepseek / model: deepseek-chat，或 gpt-4o-mini）
+# 降低单篇成本，只要对应环境变量（DEEPSEEK_API_KEY）已配置即可。
+# 注意：provider 切换后，tools/web_search 等不依赖模型，不受影响。
+models:
+  topic_planner:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.9
+  content_writer:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.7
+  reviewer:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.2
+  formatter:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.3
+  publisher:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.3
+  image_generator:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.3
+
+# 图片生成模型
+image_model:
+  provider: "dashscope"  # dashscope / openai
+  model: "wanx-v1"
+
+# API 密钥
+# 强烈建议全部留空，改用环境变量（见文件头说明）。
+# 在此填写明文密钥会在 `python main.py check` 中产生 warning，
+# 且文件若被网盘同步/打包分享会直接泄露。
+api_keys:
+  openai: ""     # 环境变量 OPENAI_API_KEY
+  deepseek: ""   # 环境变量 DEEPSEEK_API_KEY
+  dashscope: ""  # 环境变量 DASHSCOPE_API_KEY
+
+# 审核配置
+review:
+  max_retries: 2
+  min_score: 7  # 最低可接受评分 (1-10)
+
+# 发布调度
+schedule:
+  cron: "0 8 * * *"  # 每天早上 8:00 发布
+  timezone: "Asia/Shanghai"
+  max_daily_articles: 3  # 每日最大发布篇数
+
+# 浏览器配置
+browser:
+  headless: false  # 调试时设为 false，生产环境可设为 true
+  session_file: "storage/browser_session.json"
+  screenshot_dir: "storage/screenshots"
+  screenshot_retention_days: 30  # 截图保留天数（0 = 不清理）；每次发布前清理过期日期目录，防止无限堆积
+
+# 存储配置
+storage:
+  db_path: "storage/articles.db"
+  images_dir: "storage/images"
+
+# 通知配置
+notification:
+  enabled: false  # 设为 true 启用通知
+  email:
+    enabled: false
+    smtp_host: "smtp.qq.com"
+    smtp_port: 465
+    sender: ""
+    password: ""
+    receiver: ""
+  wechat_work:
+    enabled: false
+    webhook_url: ""  # 企业微信机器人 webhook URL
+
+# 飞书机器人配置（Hermes Agent）
+# 凭据一律留空，通过环境变量或本地 settings.yaml 提供。
+feishu:
+  app_id: ""                    # 飞书开放平台 App ID
+  app_secret: ""                # 飞书开放平台 App Secret
+  verification_token: ""        # 事件订阅的 Verification Token
+  encrypt_key: ""        # 事件订阅的 Encrypt Key（可选；require_encrypt=true 时必填）
+  default_chat_id: ""           # 默认通知群聊 ID
+  webhook_host: "127.0.0.1"     # Webhook 监听地址（默认回环，建议经反向代理对外）
+  webhook_port: 9000            # Webhook 监听端口
+  webhook_allow_from: []        # IP 白名单（IP 或 CIDR），为空 = 不限制；也可用环境变量 FEISHU_WEBHOOK_ALLOW_FROM（逗号分隔）覆盖
+  require_encrypt: false        # true = 强制事件加密（未加密请求一律拒绝）；也可用环境变量 HERMES_REQUIRE_ENCRYPT=1 开启
