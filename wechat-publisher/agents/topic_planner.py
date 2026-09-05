@@ -574,7 +574,7 @@ class TopicPlannerAgent(BaseAgent):
 
     # ── 候选选题批量产出（只读：不写库、不发布、不生成正文）──
 
-    def suggest_topics(self, count: int = 12) -> list[dict]:
+    def suggest_topics(self, count: int = 15) -> list[dict]:
         """产出候选选题清单供人工审核（数据化、带评分、按分降序）
 
         只做「多源采集 + 一次 LLM 头脑风暴 + 评分排序」，不写 workflow、不发布。

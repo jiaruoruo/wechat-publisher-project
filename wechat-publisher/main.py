@@ -68,7 +68,7 @@ def cmd_topics(args):
     router = LLMRouter(config)
     agent = TopicPlannerAgent(router, config)
 
-    count = getattr(args, "count", 12) or 12
+    count = getattr(args, "count", 15) or 15
     topics = agent.suggest_topics(count=count)
 
     if not topics:
@@ -490,7 +490,7 @@ def main():
 
     # topics 命令（候选选题清单，只读不发布）
     topics_parser = subparsers.add_parser("topics", help="产出候选选题清单供审核（不写库、不发布）")
-    topics_parser.add_argument("--count", type=int, default=12, help="候选数量（默认 12，实际 10~15）")
+    topics_parser.add_argument("--count", type=int, default=15, help="候选数量（默认 15，实际 13~17）")
 
     # research 命令（运营增长：竞品模式 + 表现采集，构建数据化选题库）
     research_parser = subparsers.add_parser(
