@@ -65,6 +65,16 @@ content:
     include_domain_in_query: false  # false = 不拼 domain 前缀（实测加「科技」会劣化结果）
     max_query_variants: 2         # 单关键词最多尝试的后缀数（含首轮），防止请求爆炸
     filter_aggregator_pages: true # true = 过滤「资讯/日报/导航」等聚合页，避免抹平关键词差异
+    # ── 运营增长：竞品模式 + 数据化选题 ──
+    competitor_enabled: true                      # true = 候选选题套用竞品爆款标题模式
+    competitor_max_keywords: 3                    # 竞品采集关键词上限，1~10
+    competitor_results_per_keyword: 5             # 每个竞品关键词保留条数，1~10
+    competitor_keywords: []                        # 竞品采集关键词，为空则复用 content.keywords
+    metrics_enabled: true                         # true = 评分纳入自有文章表现（若有数据）
+    score_weights:                                # 评分维度权重（自动归一，无需和为 1）
+      heat: 0.4        # 行业热度（多源资讯条目数 + 权威度）
+      pattern: 0.4     # 爆款标题模式命中
+      history: 0.2     # 自有历史表现（新号样本少，仅辅助加权）
 
 # 模型配置
 # 成本优化：reviewer/formatter/publisher/image_generator 属于确定性任务，

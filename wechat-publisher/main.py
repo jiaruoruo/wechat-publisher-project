@@ -12,8 +12,9 @@ if BASE_DIR not in sys.path:
 
 from models.llm_router import load_config, LLMRouter
 from graph.workflow import ArticleWorkflow
-from agents.topic_planner import TopicPlannerAgent
+from agents.topic_planner import TopicPlannerAgent, resolve_planning_config
 from browser.wechat_session import WechatSession
+from tools import competitor_feed, metrics_feed
 from browser.screenshot_utils import cleanup_old_screenshots
 from browser.wechat_selectors import validate_selectors_config
 from browser.selector_ledger import cleanup_old_stats
@@ -85,6 +86,92 @@ def cmd_topics(args):
         if evidence:
             print(f"   依据: {evidence}")
     print("\n请回复编号选择，或给出你自己的选题（用 run --topic 执行，当前为 draft 模式不群发）。")
+
+
+def cmd_research(args):
+    """采集竞品爆款标题 + 自有表现，提炼模式库，构建数据化选题库（research）"""
+    config = load_config()
+    db_path = config.get("storage", {}).get("db_path")
+    content = config.get("content", {})
+    planning = resolve_planning_config(content)
+    keywords = planning.get("competitor_keywords") or content.get("keywords", [])
+
+    if not keywords:
+        print("[WARNING] 未配置竞品采集关键词（content.keywords 与 topic_planning.competitor_keywords 均为空），跳过竞品采集。")
+        return
+
+    with ContentDB(db_path) as db:
+        # 1) 竞品/热门标题 + 模式库
+        titles, patterns = competitor_feed.build_competitor_bank(
+            db,
+            keywords,
+            max_keywords=planning.get("competitor_max_keywords", 3),
+            results_per_keyword=planning.get("competitor_results_per_keyword", 5),
+        )
+        print(f"\n[采集] 竞品/热门标题 {len(titles)} 条，提炼标题模式 {len(patterns)} 类")
+        for p in patterns[:12]:
+            print(f"  - [{p.get('pattern_type')}] {p.get('pattern')} (命中 {p.get('hit_count')})")
+
+        # 2) 自有文章表现（需登录会话；失败则尝试 CSV 补录）
+        metrics = []
+        csv_path = getattr(args, "metrics_csv", None)
+        if csv_path:
+            metrics = metrics_feed.import_metrics_from_csv(csv_path)
+        else:
+            try:
+                session = WechatSession(config)
+                session.start()
+                if session.check_login():
+                    metrics = metrics_feed.collect_metrics(session, config)
+                else:
+                    print("[WARNING] 公众号未登录或会话失效，跳过自有表现采集（可用 --metrics-csv 手动补录）")
+                session.close()
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARNING] 表现采集失败（已降级）: {e}")
+
+        if metrics:
+            db.save_article_metrics(metrics)
+
+        # 3) 爆款归因（即时预览）
+        report = metrics_feed.attribute_performance(metrics, patterns)
+        print(f"\n[归因] 自有表现样本 {len(metrics)} 条")
+        if not report:
+            print("  样本不足或暂无数据，暂无法归因（多运行并积累表现数据后可复盘）。")
+        else:
+            for r in report[:10]:
+                print(f"  - {r['segment']}: 均阅读 {r['avg_read']} / 均分享 {r['avg_share']} / 均点赞 {r['avg_like']} (n={r['count']})")
+
+    print("\n数据已沉淀到选题库与模式库（DB）。运行 `python main.py topics` 即可获得带评分的候选选题。")
+
+
+def cmd_report(args):
+    """输出爆款归因报告（基于已沉淀的 DB 数据，report）"""
+    config = load_config()
+    db_path = config.get("storage", {}).get("db_path")
+
+    with ContentDB(db_path) as db:
+        metrics = db.get_article_metrics()
+        patterns = db.get_title_patterns()
+        titles = db.get_competitor_titles(limit=10)
+
+    print("\n=== 爆款归因报告 ===")
+    print(f"自有表现样本: {len(metrics)} 条 | 竞品模式库: {len(patterns)} 类 | 竞品标题池: {len(titles)} 条")
+
+    if not metrics:
+        print("暂无自有表现数据：请先运行 `python main.py research`（或 research --metrics-csv 补录）采集阅读/分享/点赞。")
+        return
+
+    report = metrics_feed.attribute_performance(metrics, patterns)
+    if not report:
+        print("样本不足，无法归因。")
+        return
+
+    print("\n按平均阅读降序的归因：")
+    for r in report:
+        print(f"  - {r['segment']}: 均阅读 {r['avg_read']} | 均分享 {r['avg_share']} | 均点赞 {r['avg_like']} | n={r['count']}")
+
+    if len(metrics) < 3:
+        print("\n[提示] 样本量偏小（<3），归因结论仅供参考；随发布积累可逐步提权 history 维度。")
 
 
 def cmd_login(args):
@@ -286,6 +373,19 @@ def main():
     topics_parser = subparsers.add_parser("topics", help="产出候选选题清单供审核（不写库、不发布）")
     topics_parser.add_argument("--count", type=int, default=12, help="候选数量（默认 12，实际 10~15）")
 
+    # research 命令（运营增长：竞品模式 + 表现采集，构建数据化选题库）
+    research_parser = subparsers.add_parser(
+        "research", help="采集竞品爆款标题与自有表现，提炼模式库、构建选题库"
+    )
+    research_parser.add_argument(
+        "--metrics-csv", type=str, default=None,
+        help="手动补录自有表现数据的 CSV（列：title,publish_url,read_count,share_count,like_count），"
+             "用于后台选择器失效时兜底，不触发浏览器抓取",
+    )
+
+    # report 命令（爆款归因报告）
+    subparsers.add_parser("report", help="输出爆款归因报告（基于已沉淀的 DB 数据）")
+
     # login 命令
     login_parser = subparsers.add_parser("login", help="交互式登录公众号")
     login_parser.add_argument("--timeout", type=int, default=120, help="登录超时时间（秒）")
@@ -318,6 +418,8 @@ def main():
     commands = {
         "run": cmd_run,
         "topics": cmd_topics,
+        "research": cmd_research,
+        "report": cmd_report,
         "login": cmd_login,
         "schedule": cmd_schedule,
         "check": cmd_check,

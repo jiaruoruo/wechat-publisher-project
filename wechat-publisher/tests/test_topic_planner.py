@@ -119,8 +119,10 @@ class TopicPlannerTestCase(unittest.TestCase):
 
 class TestSpecifiedTopic(TopicPlannerTestCase):
     def test_skips_trending_search(self):
-        agent, _ = self.make_agent([self.respond()])
-        result = agent.run({"topic": "量子计算入门"})
+        # 指定选题：跳过搜索引擎；mock 多源采集使 trending_ok 取证为空集，断言稳定
+        with mock.patch("tools.sources_feed.collect_and_grade", return_value=[]):
+            agent, _ = self.make_agent([self.respond()])
+            result = agent.run({"topic": "量子计算入门"})
 
         self.trending_mock.assert_not_called()
         self.assertTrue(result["metadata"]["trending_skipped"])
