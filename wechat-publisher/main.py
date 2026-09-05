@@ -2,6 +2,7 @@
 
 import os
 import sys
+import json
 import argparse
 import logging
 
@@ -13,6 +14,7 @@ if BASE_DIR not in sys.path:
 from models.llm_router import load_config, LLMRouter
 from graph.workflow import ArticleWorkflow
 from agents.topic_planner import TopicPlannerAgent, resolve_planning_config
+from agents.content.pipeline import run_content_pipeline
 from browser.wechat_session import WechatSession
 from tools import competitor_feed, metrics_feed
 from browser.screenshot_utils import cleanup_old_screenshots
@@ -45,6 +47,10 @@ def cmd_run(args):
         initial_state["topic"] = args.topic
     if args.title:
         initial_state["article_title"] = args.title
+        # 显式指定标题时把原始输入存入 metadata：content_writer 的标题创作阶段
+        # 只出候选、不覆盖，避免用户意图被七阶段重生成的新标题冲掉
+        # （存原始值而非 True，是为了绕开 topic_planner 可能的改写）。
+        initial_state["metadata"] = {"title_pinned": args.title}
 
     result = workflow.run(initial_state if initial_state else None)
 
@@ -172,6 +178,118 @@ def cmd_report(args):
 
     if len(metrics) < 3:
         print("\n[提示] 样本量偏小（<3），归因结论仅供参考；随发布积累可逐步提权 history 维度。")
+
+
+def _compose_markdown(result: dict) -> str:
+    """把创作结果拼成可落盘的 Markdown（标题 + 摘要 + 标签 + 封面提示词 + 正文）"""
+    lines = [f"# {result.get('title', '')}", ""]
+
+    summary = result.get("summary") or {}
+    if summary.get("one_liner"):
+        lines += [f"> {summary['one_liner']}", ""]
+
+    tags = result.get("tags") or []
+    if tags:
+        lines += [f"标签：{' / '.join(tags)}", ""]
+
+    if result.get("cover_prompt"):
+        lines += [f"封面提示词：{result['cover_prompt']}", ""]
+
+    lines += [result.get("content", ""), ""]
+    return "\n".join(lines)
+
+
+def _print_compose_result(result: dict):
+    """以人读友好的方式打印 7 阶段创作结果"""
+    print(f"\n=== 标题 ===\n{result.get('title', '')}")
+
+    candidates = result.get("title_candidates") or []
+    if candidates:
+        print("\n候选标题：")
+        for i, c in enumerate(candidates, 1):
+            style = c.get("style") or ""
+            suffix = f"  [{style}]" if style else ""
+            print(f"  {i}. {c.get('title', '')}{suffix}")
+
+    analysis = result.get("topic_analysis") or {}
+    if analysis.get("target_audience"):
+        print(f"\n=== 目标受众 ===\n{analysis['target_audience']}")
+    if analysis.get("angle"):
+        print(f"\n切入角度：{analysis['angle']}")
+    if analysis.get("key_points"):
+        print("\n必覆盖要点：")
+        for p in analysis["key_points"]:
+            print(f"  - {p}")
+
+    print(f"\n=== 大纲 ===\n{result.get('outline', '')}")
+
+    summary = result.get("summary") or {}
+    if summary.get("one_liner"):
+        print(f"\n=== 摘要 ===\n{summary['one_liner']}")
+    if summary.get("key_points"):
+        print("\n核心要点：")
+        for p in summary["key_points"]:
+            print(f"  - {p}")
+    if summary.get("gist"):
+        print(f"\n精华段：\n{summary['gist']}")
+
+    tags = result.get("tags") or []
+    if tags:
+        print(f"\n=== 标签 ===\n{' / '.join(tags)}")
+
+    print(f"\n=== 封面提示词 ===\n{result.get('cover_prompt', '')}")
+    inline = result.get("inline_prompts") or []
+    if inline:
+        print("\n插图提示词：")
+        for i, p in enumerate(inline, 1):
+            print(f"  {i}. {p}")
+
+    content = result.get("content") or ""
+    print(f"\n=== 正文（{len(content)} 字）===\n{content}")
+
+
+def cmd_compose(args):
+    """按指定主题单独跑 7 个创作阶段（不发布、不落库）
+
+    主题通常来自 `topics` 命令给出的候选范围，由人工指定后传入本命令。
+    """
+    config = load_config()
+    content_config = config.get("content") or {}
+    length = content_config.get("article_length") or {}
+
+    router = LLMRouter(config)
+
+    print("\n=== 内容创作七阶段 ===")
+    print(f"主题: {args.topic}")
+
+    result = run_content_pipeline(
+        llm_router=router,
+        config=config,
+        topic=args.topic,
+        audience_hint=args.audience or "",
+        style=content_config.get("style") or "",
+        min_words=args.words_min or int(length.get("min") or 1500),
+        max_words=args.words_max or int(length.get("max") or 3000),
+        image_count=args.image_count,
+        on_stage=lambda name, idx: print(f"  [{idx + 1}/7] {name} ...", flush=True),
+    )
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        _print_compose_result(result)
+
+    if getattr(args, "out", None):
+        try:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(_compose_markdown(result))
+            print(f"\n已写入: {args.out}")
+        except Exception as e:
+            print(f"\n写入文件失败: {e}")
+
+    degraded = result.get("degraded") or []
+    if degraded:
+        print(f"\n[提示] 以下阶段发生降级（已回落兜底值）: {', '.join(degraded)}")
 
 
 def cmd_login(args):
@@ -348,6 +466,7 @@ def main():
 使用示例:
   python main.py run                    # 立即执行一次完整工作流
   python main.py run --topic "AI趋势"   # 指定选题执行
+  python main.py compose --topic "AI趋势" # 按指定主题跑创作七阶段（不发布）
   python main.py --run-now              # 立即执行（快捷方式）
   python main.py login                  # 交互式登录公众号
   python main.py schedule               # 启动定时调度
@@ -386,6 +505,18 @@ def main():
     # report 命令（爆款归因报告）
     subparsers.add_parser("report", help="输出爆款归因报告（基于已沉淀的 DB 数据）")
 
+    # compose 命令（内容创作七阶段：主题分析→大纲→标题→正文→摘要→标签→图像提示词）
+    compose_parser = subparsers.add_parser(
+        "compose", help="按指定主题跑内容创作七阶段（不发布、不落库）"
+    )
+    compose_parser.add_argument("--topic", type=str, required=True, help="创作主题（可从 topics 命令的候选里人工指定）")
+    compose_parser.add_argument("--audience", type=str, default="", help="目标受众提示（可选）")
+    compose_parser.add_argument("--words-min", type=int, default=0, help="正文最小字数（默认取配置）")
+    compose_parser.add_argument("--words-max", type=int, default=0, help="正文最大字数（默认取配置）")
+    compose_parser.add_argument("--image-count", type=int, default=3, help="期望插图数量（默认 3）")
+    compose_parser.add_argument("--out", type=str, default=None, help="将结果写入 Markdown 文件")
+    compose_parser.add_argument("--json", action="store_true", help="以 JSON 输出完整结果（便于程序消费）")
+
     # login 命令
     login_parser = subparsers.add_parser("login", help="交互式登录公众号")
     login_parser.add_argument("--timeout", type=int, default=120, help="登录超时时间（秒）")
@@ -420,6 +551,7 @@ def main():
         "topics": cmd_topics,
         "research": cmd_research,
         "report": cmd_report,
+        "compose": cmd_compose,
         "login": cmd_login,
         "schedule": cmd_schedule,
         "check": cmd_check,

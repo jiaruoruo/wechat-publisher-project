@@ -90,6 +90,38 @@ models:
     provider: "deepseek"
     model: "deepseek-chat"
     temperature: 0.7
+  # ── 内容创作七阶段（由 content_writer 在其内部串行调用）──
+  # 缺省时自动回落 content_writer 的模型，不影响运行；
+  # 在此显式给出不同 temperature 是为了让「创作类」与「抽取类」阶段各取所需：
+  # 分析/大纲/标题/正文需要发散，摘要/标签/配图描述需要稳定。
+  topic_analyzer:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.8
+  outline_generator:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.7
+  title_generator:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.9
+  content_drafter:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.7
+  summary_extractor:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.2
+  tag_extractor:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.2
+  image_prompt_generator:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.6
   reviewer:
     provider: "deepseek"
     model: "deepseek-chat"
