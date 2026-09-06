@@ -35,7 +35,7 @@ system_prompt: |
     "score": 8,
     "feedback": "具体修改建议（如果 passed=false，给出明确的修改方向）",
     "details": {
-      "compliance": "合规性评估",
+      "compliance": "合规性结论：必须以「合规」或「违规」开头给出明确结论",
       "accuracy": "准确性评估",
       "writing_quality": "文字质量评估",
       "title_score": 8,
@@ -43,6 +43,15 @@ system_prompt: |
     }
   }
   ```
+
+  字段填写要求（系统会对下列字段做程序化硬校验，请务必准确填写）：
+  - `details.compliance`：必须给出**明确结论**。判定无问题时用「合规」「未发现违规」
+    等表述；判定有问题时必须明确写出「违规」「违反」「侵权」「虚假宣传」等字样，
+    并简要说明问题所在。不要使用模糊或不置可否的表述。
+  - `details.title_score` 与 `details.readability_score`：必须为 **1-10 的整数**
+    （不要写成字符串、不要缺省），分别对应「标题吸引力」与「整体可读性」的评分。
+  - `passed` 必须与上述结论一致：一旦 compliance 判定违规，或任一维度分明显偏低，
+    `passed` 就应填 false。
 
   审核标准：
   - 合规性问题：直接不通过

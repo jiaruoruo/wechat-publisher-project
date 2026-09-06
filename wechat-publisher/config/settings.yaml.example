@@ -158,6 +158,57 @@ review:
   max_retries: 2
   min_score: 7  # 最低可接受评分 (1-10)
 
+  # ── 维度分门槛：校验 LLM 返回的 details.title_score / details.readability_score ──
+  # 0 = 关闭该项校验；字段缺失或非数值时跳过该门控（不误杀）
+  min_title_score: 4        # 标题维度最低分(1-10)
+  min_readability_score: 4  # 可读性维度最低分(1-10)
+
+  # compliance 文本门控：details.compliance 命中下列词即强制不通过。
+  # 已做否定前缀防护，「未违规 / 不存在侵权」等否定表述不会误判。
+  compliance_negative_keywords:
+    - "违规"
+    - "违反"
+    - "不通过"
+    - "敏感"
+    - "侵权"
+    - "虚假宣传"
+
+  # 分类敏感词 starter 词表：命中任一即阻断，feedback 会标明命中类别。
+  # 政治类留空，请按你所在平台/主体的合规要求自行填写；
+  # 其余三类为通用合规 starter 词（广告法绝对化用语、虚假宣传、侵权转载）。
+  sensitive_words:
+    political: []             # 政治敏感（请自行补充）
+    false_advertising:        # 虚假宣传 / 夸大承诺
+      - "100%有效"
+      - "永久免费"
+      - "保证治愈"
+      - "包过"
+      - "稳赚不赔"
+      - "彻底根治"
+      - "零风险"
+      - "一夜暴富"
+    absolute_terms:           # 广告法禁用绝对化用语
+      - "国家级"
+      - "最高级"
+      - "最佳"
+      - "第一品牌"
+      - "唯一指定"
+      - "顶级"
+      - "极品"
+      - "极致"
+      - "史上最"
+      - "绝对领先"
+      - "全网最低"
+    infringement:             # 侵权 / 违规转载
+      - "未经授权转载"
+      - "盗版"
+      - "破解版"
+      - "免费下载全站"
+      - "搬运自"
+
+  # 平铺额外词表（向后兼容）：与 sensitive_words 合并生效
+  banned_keywords: []
+
 # 发布调度
 schedule:
   cron: "0 8 * * *"  # 每天早上 8:00 发布
