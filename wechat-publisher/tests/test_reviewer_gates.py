@@ -291,6 +291,52 @@ class TestRunAdjudication(unittest.TestCase):
         self.assertEqual(entry["score"], 8)
         self.assertEqual(entry["details"]["title_score"], 8)
 
+    def test_naturalness_veto(self):
+        """正文 AI 味过重（naturalness 分低）时，即便 LLM 通过也应被否决"""
+        result = self._run(
+            {"min_score": 7, "min_naturalness_score": 4},
+            {
+                "passed": True,
+                "score": 9,
+                "feedback": "",
+                "details": {"naturalness_score": 2},
+            },
+            content=LONG_CONTENT,
+        )
+        self.assertFalse(result["review_result"]["passed"])
+        self.assertIn("自然度", result["review_result"]["feedback"])
+
+
+class TestNaturalnessGate(unittest.TestCase):
+    """details.naturalness_score 维度分门槛（缺字段/非数值跳过，不误杀）"""
+
+    def setUp(self):
+        self.agent = _make_agent({"min_naturalness_score": 4})
+
+    def test_missing_field_skips(self):
+        self.assertFalse(
+            self.agent._enforce_details_gates({"compliance": "合规"})["blocked"]
+        )
+
+    def test_below_threshold_blocks(self):
+        result = self.agent._enforce_details_gates({"naturalness_score": 2})
+        self.assertTrue(result["blocked"])
+        self.assertIn("自然度", result["issues"][0])
+
+    def test_above_threshold_passes(self):
+        result = self.agent._enforce_details_gates({"naturalness_score": 8})
+        self.assertFalse(result["blocked"])
+        self.assertEqual(result["report"]["naturalness_score"], 8)
+
+    def test_threshold_zero_disables(self):
+        agent = _make_agent({"min_naturalness_score": 0})
+        result = agent._enforce_details_gates({"naturalness_score": 1})
+        self.assertFalse(result["blocked"])
+
+    def test_non_numeric_skipped(self):
+        result = self.agent._enforce_details_gates({"naturalness_score": "偏低"})
+        self.assertFalse(result["blocked"])
+
 
 if __name__ == "__main__":
     unittest.main()

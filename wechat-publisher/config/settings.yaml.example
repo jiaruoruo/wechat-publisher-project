@@ -45,6 +45,10 @@ content:
   style: "面向大众读者的科技观察者口吻：专业但不掉书袋，遇到芯片、模型、机器人等术语先用一句人话解释清楚再展开；多用具体案例、数字和类比，少用形容词和空话；语气克制冷静，不吹不黑，兼顾技术判断与产业视角；避免标题党与制造焦虑。"
   template: "simple"  # 排版模板: simple / business / lively
 
+  # 去AI味改写节点（独立节点，位于 content_writer 与 image_generator 之间）
+  # false = 关闭该节点，行为完全等同改造前的「无去AI味」，便于回退与成本控制
+  deai_enabled: true
+
   # 选题策划参数（全部可选）
   # 缺省、类型非法或越界时一律静默回落默认值并记一条 warning，不会中断运行
   topic_planning:
@@ -90,6 +94,10 @@ models:
     provider: "deepseek"
     model: "deepseek-chat"
     temperature: 0.7
+  deai_rewriter:
+    provider: "deepseek"
+    model: "deepseek-chat"
+    temperature: 0.7  # 创意改写，略高于抽取类（0.2）
   # ── 内容创作七阶段（由 content_writer 在其内部串行调用）──
   # 缺省时自动回落 content_writer 的模型，不影响运行；
   # 在此显式给出不同 temperature 是为了让「创作类」与「抽取类」阶段各取所需：
@@ -162,6 +170,9 @@ review:
   # 0 = 关闭该项校验；字段缺失或非数值时跳过该门控（不误杀）
   min_title_score: 4        # 标题维度最低分(1-10)
   min_readability_score: 4  # 可读性维度最低分(1-10)
+  # 自然度/去AI味维度最低分(1-10)：低于该分由 reviewer 强制不通过（双保险）。
+  # 0 = 关闭该校验（不误杀）。因会提高重试概率，请结合成本评估调整。
+  min_naturalness_score: 4
 
   # compliance 文本门控：details.compliance 命中下列词即强制不通过。
   # 已做否定前缀防护，「未违规 / 不存在侵权」等否定表述不会误判。

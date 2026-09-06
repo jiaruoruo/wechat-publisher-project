@@ -49,6 +49,8 @@ class ReviewerAgent(BaseAgent):
         # 维度分门槛：0 = 关闭该项校验（缺失/非数值时跳过，不误杀）
         self.min_title_score = self.review_config.get("min_title_score", 0)
         self.min_readability_score = self.review_config.get("min_readability_score", 0)
+        # 自然度/去AI味维度门槛：0 = 关闭校验；缺失/非数值时跳过（不误杀）
+        self.min_naturalness_score = self.review_config.get("min_naturalness_score", 0)
         # details.compliance 文本的违规判定词（命中即一票否决）
         self.compliance_negative_keywords = (
             self.review_config.get("compliance_negative_keywords") or []
@@ -306,6 +308,7 @@ class ReviewerAgent(BaseAgent):
         for field, threshold, label in (
             ("title_score", self.min_title_score, "标题"),
             ("readability_score", self.min_readability_score, "可读性"),
+            ("naturalness_score", self.min_naturalness_score, "自然度/去AI味"),  # 新增：去AI味双保险
         ):
             if not threshold:
                 continue

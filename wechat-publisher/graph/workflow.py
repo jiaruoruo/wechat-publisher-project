@@ -15,6 +15,7 @@ from agents.topic_planner import TopicPlannerAgent
 from agents.content_writer import ContentWriterAgent
 from agents.image_generator import ImageGeneratorAgent
 from agents.reviewer import ReviewerAgent
+from agents.deai_rewriter import DeaiRewriterAgent
 from agents.formatter import FormatterAgent
 from agents.publisher import PublisherAgent
 from tools.content_db import ContentDB
@@ -30,10 +31,10 @@ logger = logging.getLogger(__name__)
 _LLM_ROUTER_CACHE: dict[int, "LLMRouter"] = {}
 
 # ── 递归限制计算 ────────────────────────────────────────
-# 快乐路径 6 节点：topic_planner → content_writer → image_generator → reviewer → formatter → publisher
-_HAPPY_PATH_NODES = 6
-# 每轮回退 4 节点：retry_counter → content_writer → image_generator → reviewer
-_RETRY_ROUND_NODES = 4
+# 快乐路径 7 节点：topic_planner → content_writer → deai → image_generator → reviewer → formatter → publisher
+_HAPPY_PATH_NODES = 7
+# 每轮回退 5 节点：retry_counter → content_writer → deai → image_generator → reviewer
+_RETRY_ROUND_NODES = 5
 
 
 def _recursion_limit(max_retries: int) -> int:
@@ -50,7 +51,7 @@ def _recursion_limit(max_retries: int) -> int:
 
 
 class ArticleWorkflow:
-    """文章生产工作流 - 编排 6 个 Agent 的协作"""
+    """文章生产工作流 - 编排 7 个 Agent 的协作（含去AI味改写节点）"""
 
     def __init__(self, config: dict | None = None):
         self.config = config or load_config()
@@ -67,6 +68,7 @@ class ArticleWorkflow:
         self.content_writer = ContentWriterAgent(self.llm_router, self.config)
         self.image_generator = ImageGeneratorAgent(self.llm_router, self.config)
         self.reviewer = ReviewerAgent(self.llm_router, self.config)
+        self.deai = DeaiRewriterAgent(self.llm_router, self.config)
         self.formatter = FormatterAgent(self.llm_router, self.config)
         self.publisher = PublisherAgent(self.llm_router, self.config)
 
@@ -88,6 +90,7 @@ class ArticleWorkflow:
         workflow.add_node("content_writer", self.content_writer)
         workflow.add_node("image_generator", self.image_generator)
         workflow.add_node("reviewer", self.reviewer)
+        workflow.add_node("deai", self.deai)
         workflow.add_node("retry_counter", increment_retry)  # 重试计数集中在 workflow 层
         workflow.add_node("formatter", self.formatter)
         workflow.add_node("publisher", self.publisher)
@@ -103,7 +106,8 @@ class ArticleWorkflow:
                 "aborted": END,
             },
         )
-        workflow.add_edge("content_writer", "image_generator")
+        workflow.add_edge("content_writer", "deai")
+        workflow.add_edge("deai", "image_generator")
         workflow.add_edge("image_generator", "reviewer")
 
         # 审核条件分支：不通过且未达上限 → 先计数再回退重写

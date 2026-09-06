@@ -6,8 +6,9 @@
     1 主题分析 → 2 大纲生成 → 3 标题创作 → 4 内容生成
       → 5 摘要提炼 → 6 标签提取 → 7 图像提示词生成
 
-对外契约不变：在主工作流中仍是**单个** content_writer 节点
-（graph/workflow.py 的节点与连线零改动，递归上限不受影响）。
+对外契约不变：在主工作流中仍是**单个** content_writer 节点。
+（本次新增的「去AI味」节点位于本节点之后、image_generator 之前，属于独立的
+工作流节点，不在本 Agent 内部；graph/workflow.py 的递归上限已同步上调。）
 
 可靠性约定：
 - 任一阶段失败 → 记 warning + metadata 打降级标记 → 回落为 topic_planner

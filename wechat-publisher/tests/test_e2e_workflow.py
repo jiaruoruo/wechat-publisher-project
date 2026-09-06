@@ -109,6 +109,10 @@ class Scenario:
             }, ensure_ascii=False)
         if agent_name == "formatter":
             return "<section><h2>引言</h2><p>正文</p></section>"
+        if agent_name == "deai_rewriter":
+            # 去AI味节点：桩中不做实际改写，原样（保留 [IMAGE:] 标记）返回，
+            # 以验证节点在流程中透传、保全校验通过，并刷新摘要/标签。
+            return "## 引言\n\n正文内容（已去AI味）……\n\n[IMAGE: 数据图表]\n\n## 总结\n"
         return ""
 
 

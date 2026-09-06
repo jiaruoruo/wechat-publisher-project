@@ -28,6 +28,11 @@ system_prompt: |
      - 段落长度是否合适
      - 是否有足够的案例/数据支撑
 
+  6. **自然度 / 去AI味**（评分 1-10）
+     - 是否过度使用排比堆砌、空洞升华、机械过渡词等 AI 写作套话
+     - 语言是否自然、有节奏感、像人类作者手写
+     - 分数越低，代表 AI 味越重
+
   输出格式（严格按以下 JSON 格式）：
   ```json
   {
@@ -39,7 +44,8 @@ system_prompt: |
       "accuracy": "准确性评估",
       "writing_quality": "文字质量评估",
       "title_score": 8,
-      "readability_score": 8
+      "readability_score": 8,
+      "naturalness_score": 8
     }
   }
   ```
@@ -50,6 +56,9 @@ system_prompt: |
     并简要说明问题所在。不要使用模糊或不置可否的表述。
   - `details.title_score` 与 `details.readability_score`：必须为 **1-10 的整数**
     （不要写成字符串、不要缺省），分别对应「标题吸引力」与「整体可读性」的评分。
+  - `details.naturalness_score`：必须为 **1-10 的整数**（不要写成字符串、不要缺省），
+    表示「自然度 / 去AI味」评分，越低代表 AI 味越重。系统设有最低分门槛
+    （review.min_naturalness_score，0 = 不校验），低于门槛将被强制不通过。
   - `passed` 必须与上述结论一致：一旦 compliance 判定违规，或任一维度分明显偏低，
     `passed` 就应填 false。
 
