@@ -23,3 +23,6 @@ storage/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# ── 项目数据（CodeBuddy 运行时数据，非源码，禁止提交）────
+.codebuddy/

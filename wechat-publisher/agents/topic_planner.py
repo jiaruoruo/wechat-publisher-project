@@ -21,6 +21,7 @@ import tools.sources_feed as sources_feed
 from tools.content_db import ContentDB
 from tools.json_utils import safe_extract_json
 from tools.topic_dedup import DEFAULT_THRESHOLD, find_most_similar, normalize
+from tools.topic_scorer import score_topic
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,13 @@ _PLANNING_DEFAULTS = {
     "include_domain_in_query": False,
     "max_query_variants": 2,
     "filter_aggregator_pages": True,
+    # ── 运营增长：竞品模式 + 数据化选题 ──
+    "competitor_enabled": True,                      # true = 候选选题时套用竞品爆款标题模式
+    "competitor_max_keywords": 3,                    # 竞品采集关键词上限，1~10
+    "competitor_results_per_keyword": 5,             # 每个竞品关键词保留条数，1~10
+    "competitor_keywords": [],                       # 为空则复用 content.keywords
+    "metrics_enabled": True,                         # true = 评分时纳入自有文章表现（若有数据）
+    "score_weights": {"heat": 0.4, "pattern": 0.4, "history": 0.2},
 }
 
 
@@ -95,6 +103,36 @@ def resolve_planning_config(content_config: dict) -> dict:
         elif key == "max_query_variants":
             if not isinstance(value, int) or value < 1:
                 value = default
+        elif key == "competitor_enabled":
+            value = bool(value) if isinstance(value, bool) else default
+        elif key == "metrics_enabled":
+            value = bool(value) if isinstance(value, bool) else default
+        elif key == "competitor_max_keywords":
+            if not isinstance(value, int) or not (1 <= value <= 10):
+                value = default
+        elif key == "competitor_results_per_keyword":
+            if not isinstance(value, int) or not (1 <= value <= 10):
+                value = default
+        elif key == "competitor_keywords":
+            if not isinstance(value, list) or not all(
+                isinstance(s, str) and s.strip() for s in value
+            ):
+                value = default
+            else:
+                value = [s.strip() for s in value]
+        elif key == "score_weights":
+            if not isinstance(value, dict):
+                value = default
+            else:
+                w = {}
+                for wk in ("heat", "pattern", "history"):
+                    wv = value.get(wk)
+                    w[wk] = (
+                        float(wv)
+                        if isinstance(wv, (int, float))
+                        else default["score_weights"][wk]
+                    )
+                value = w
         else:
             # 上下界都钳制：上界同样是成本/耗时守卫而非格式约束
             # （max_keywords=999 会真的发出 999 次网络请求）
@@ -102,7 +140,7 @@ def resolve_planning_config(content_config: dict) -> dict:
             if not isinstance(value, int) or not (low <= value <= high):
                 value = default
 
-        if not isinstance(default, list) and value != raw.get(key, default):
+        if not isinstance(default, (list, dict)) and value != raw.get(key, default):
             logger.warning(
                 f"content.topic_planning.{key} 值非法（{raw.get(key)!r}），回落为 {value}"
             )
@@ -536,19 +574,26 @@ class TopicPlannerAgent(BaseAgent):
 
     # ── 候选选题批量产出（只读：不写库、不发布、不生成正文）──
 
-    def suggest_topics(self, count: int = 12) -> list[dict]:
-        """产出候选选题清单供人工审核
+    def suggest_topics(self, count: int = 15) -> list[dict]:
+        """产出候选选题清单供人工审核（数据化、带评分、按分降序）
 
-        只做「多源采集 + 一次 LLM 头脑风暴」，不写 DB、不进 workflow、不发布。
+        只做「多源采集 + 一次 LLM 头脑风暴 + 评分排序」，不写 workflow、不发布。
         LLM 失败或解析失败时返回 []，绝不抛异常（候选清单是辅助决策，不可阻断）。
 
-        Returns: [{"title","angle","why","direction","region","evidence","confidence"}, ...]
+        评分与选题库落库均为增强项：任一环节失败都静默降级（评分记 0、不落库），
+        不影响候选清单本身返回。
+
+        Returns: [{"title","angle","why","direction","region","evidence",
+                   "confidence","score","score_detail","pattern"}, ...]（按分降序）
         """
         # 多源采集（国际权威源 + 国内媒体），含可信度分级
         items = sources_feed.collect_and_grade(topics=["ai", "robotics", "chip"])
         evidence = sources_feed.to_text(items, limit=80) or "（本次未采集到多源资讯，请基于领域知识策划）"
 
-        prompt = self._build_ideas_prompt(evidence, count)
+        # 竞品爆款模式 + 自有表现（评分用），读取失败则降级为空
+        patterns, metrics = self._load_growth_context()
+
+        prompt = self._build_ideas_prompt(evidence, count, patterns)
 
         try:
             raw = self.invoke(prompt, json_mode=True)
@@ -584,11 +629,89 @@ class TopicPlannerAgent(BaseAgent):
                 "confidence": str(item.get("confidence") or "medium").strip()[:20],
             })
 
+        # 评分 + 按分降序（失败降级：评分记 0，仍返回候选）
+        result = self._enrich_and_rank(result, items, patterns, metrics)
+        # 选题库落库（best-effort，失败不阻断）
+        self._persist_topic_bank(result)
+
         logger.info(f"候选选题产出 {len(result)} 条")
         return result
 
-    def _build_ideas_prompt(self, evidence: str, count: int) -> str:
-        """构造候选选题 prompt（模板从 config/prompts/topic_ideas.yaml 读取）"""
+    def _load_growth_context(self) -> tuple[list[dict], list[dict]]:
+        """读取竞品标题模式库与自有表现数据（评分用）
+
+        数据来自 research 命令沉淀的 DB 表；本环节任何失败都降级为空，
+        不影响候选选题产出。
+        """
+        patterns: list[dict] = []
+        metrics: list[dict] = []
+        db_path = self.config.get("storage", {}).get("db_path")
+        if not db_path:
+            return patterns, metrics
+        try:
+            with ContentDB(db_path) as db:
+                if self.planning.get("competitor_enabled"):
+                    patterns = db.get_title_patterns()
+                if self.planning.get("metrics_enabled"):
+                    metrics = db.get_article_metrics()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"读取增长上下文失败（降级为空）: {e}")
+        return patterns, metrics
+
+    def _enrich_and_rank(
+        self,
+        result: list[dict],
+        evidence_items: list[dict],
+        patterns: list[dict],
+        metrics: list[dict],
+    ) -> list[dict]:
+        """给候选选题打分、附加模式命中，并按分数降序"""
+        enriched: list[dict] = []
+        for r in result:
+            score, detail = score_topic(
+                r,
+                evidence_items=evidence_items,
+                patterns=patterns,
+                history_metrics=metrics,
+                weights=self.planning.get("score_weights"),
+            )
+            item = dict(r)
+            item["score"] = score
+            item["score_detail"] = detail
+            item["pattern"] = "; ".join(detail.get("matched_patterns", []))[:200]
+            enriched.append(item)
+        enriched.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return enriched
+
+    def _persist_topic_bank(self, topics: list[dict]) -> None:
+        """把评分后的候选选题落库（best-effort，失败静默不阻断）"""
+        db_path = self.config.get("storage", {}).get("db_path")
+        if not db_path or not topics:
+            return
+        try:
+            with ContentDB(db_path) as db:
+                db.save_topic_bank([
+                    {
+                        "title": t.get("title", ""),
+                        "angle": t.get("angle", ""),
+                        "why": t.get("why", ""),
+                        "direction": t.get("direction", ""),
+                        "score": t.get("score", 0.0),
+                        "score_detail": t.get("score_detail", {}),
+                        "pattern": t.get("pattern", ""),
+                        "evidence": t.get("evidence", ""),
+                        "confidence": t.get("confidence", "medium"),
+                    }
+                    for t in topics
+                ])
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"选题库落库失败（不阻断）: {e}")
+
+    def _build_ideas_prompt(self, evidence: str, count: int, patterns: list[dict] | None = None) -> str:
+        """构造候选选题 prompt（模板从 config/prompts/topic_ideas.yaml 读取）
+
+        patterns: 已验证的竞品爆款标题模式库；为空时给通用爆款原则提示。
+        """
         import yaml
         import os
 
@@ -604,12 +727,32 @@ class TopicPlannerAgent(BaseAgent):
         except Exception as e:
             logger.debug(f"topic_ideas 模板读取失败，使用内置模板: {e}")
 
-        return template.format(
-            count=count,
-            domain=self.domain,
-            style=self.content_config.get("style", "专业但通俗易懂"),
-            evidence=evidence,
-        )
+        # 组装「已验证爆款标题模式」段落（注入 prompt，强制 LLM 套用）
+        if patterns:
+            lines = [f"- [{p.get('pattern_type')}] {p.get('pattern')}（命中 {p.get('hit_count')} 次，样例：{p.get('sample')}）"
+                     for p in patterns[:12]]
+            patterns_block = "已验证的爆款标题模式（请尽量套用其句式/钩子）：\n" + "\n".join(lines)
+        else:
+            patterns_block = ("暂无已积累的竞品爆款模式，请基于通用爆款原则设计标题："
+                              "① 含具体数字/年份；② 用疑问引发好奇；③ 制造反差/对比；"
+                              "④ 盘点式清单（十大/榜单）；⑤ 带时效或稀缺钩子（最新/必看）。")
+
+        try:
+            return template.format(
+                count=count,
+                domain=self.domain,
+                style=self.content_config.get("style", "专业但通俗易懂"),
+                evidence=evidence,
+                patterns=patterns_block,
+            )
+        except (KeyError, IndexError):
+            # 模板未含 {patterns} 占位时退回不注入模式
+            return template.format(
+                count=count,
+                domain=self.domain,
+                style=self.content_config.get("style", "专业但通俗易懂"),
+                evidence=evidence,
+            )
 
     def _provider_name(self) -> str:
         return (

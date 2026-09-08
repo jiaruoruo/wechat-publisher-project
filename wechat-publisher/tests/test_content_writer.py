@@ -129,14 +129,42 @@ class TestPromptIntegrity(unittest.TestCase):
             self.assertIn(fragment, prompt)
 
     def test_run_uses_new_prompt_on_first_attempt(self):
+        # 改造后首次成文走七阶段流水线：7 个子 Agent 各 1 次 LLM 调用
         agent, llm = make_agent({"content": {"style": CUSTOM_STYLE}})
         result = agent.run({
             "topic": "主题", "outline": "大纲",
             "article_title": "标题", "target_audience": "受众",
             "retry_count": 0, "review_result": {},
         })
-        self.assertEqual(llm.calls, 1)
+        self.assertEqual(llm.calls, 7)
+        # 桩件对 JSON 阶段返回的都是非 JSON 文本，解析失败后回落前序值：
+        # 标题回落 topic_planner 已产出的标题，用户意图不被冲掉。
         self.assertEqual(result["article_title"], "标题")
+        self.assertEqual(result["content"], "# 标题\n\n正文")
+
+    def test_run_rewrite_path_does_not_rerun_full_pipeline(self):
+        # 审核不通过时沿用重写契约：不重跑七阶段，仅重写正文 + 刷新摘要/标签
+        agent, llm = make_agent({"content": {"style": CUSTOM_STYLE}})
+        result = agent.run({
+            "topic": "主题", "outline": "大纲",
+            "article_title": "标题", "target_audience": "受众",
+            "content": "原文", "retry_count": 1,
+            "review_result": {"passed": False, "feedback": "请补充数据来源"},
+        })
+        # 1 次重写 + 2 次刷新（摘要、标签），远小于重跑七阶段的 7 次
+        self.assertEqual(llm.calls, 3)
+        self.assertEqual(result["article_title"], "标题")
+
+    def test_title_pinned_is_not_overwritten(self):
+        # 用户显式指定标题（cmd_run --title）时，标题创作阶段不得覆盖
+        agent, _ = make_agent({"content": {"style": CUSTOM_STYLE}})
+        result = agent.run({
+            "topic": "主题", "outline": "大纲",
+            "article_title": "用户指定标题", "target_audience": "受众",
+            "retry_count": 0, "review_result": {},
+            "metadata": {"title_pinned": "用户指定标题"},
+        })
+        self.assertEqual(result["article_title"], "用户指定标题")
 
 
 if __name__ == "__main__":

@@ -1,17 +1,48 @@
-"""内容创作 Agent - 撰写图文正文"""
+"""内容创作 Agent - 撰写图文正文
 
-import json
+流水线定位：选题 agent（topic_planner）产出选题后，本节点**内部**串行执行
+7 个创作阶段，把原本「一次 LLM 直接成文」升级为精细化创作：
+
+    1 主题分析 → 2 大纲生成 → 3 标题创作 → 4 内容生成
+      → 5 摘要提炼 → 6 标签提取 → 7 图像提示词生成
+
+对外契约不变：在主工作流中仍是**单个** content_writer 节点。
+（本次新增的「去AI味」节点位于本节点之后、image_generator 之前，属于独立的
+工作流节点，不在本 Agent 内部；graph/workflow.py 的递归上限已同步上调。）
+
+可靠性约定：
+- 任一阶段失败 → 记 warning + metadata 打降级标记 → 回落为 topic_planner
+  已产出的同名字段（即退化成改造前行为）；
+- 正文阶段整体失败 → 用 _build_new_prompt 兜底单次成文。
+  因此最差情况等价于改造前，绝不比现在更难产。
+
+覆盖约定：
+- 7 阶段产出的 outline / article_title / summary / cover_prompt / target_audience
+  覆盖 topic_planner 的同名字段（后者多为弱值，如 summary 仅为 outline[:50]）；
+- 但命令行 --title 显式指定的标题不被覆盖（metadata.title_pinned 保护）。
+"""
+
 import logging
 from datetime import datetime
 
 from agents.base import BaseAgent
 from graph.state import ArticleState
+from agents.content.pipeline import (
+    FallbackLLMRouter,
+    run_content_pipeline,
+    summary_to_text,
+)
+from agents.content.summary_extractor import SummaryExtractorAgent
+from agents.content.tag_extractor import TagExtractorAgent
 
 logger = logging.getLogger(__name__)
 
+# 期望插图数量：与改造前「每篇 2-4 处」的建议一致，取中值
+_DEFAULT_IMAGE_COUNT = 3
+
 
 class ContentWriterAgent(BaseAgent):
-    """内容创作 Agent：根据选题撰写完整文章"""
+    """内容创作 Agent：在选题确定后串行执行 7 个创作阶段产出文章"""
 
     agent_name = "content_writer"
     prompt_file = "content_writer.yaml"
@@ -26,9 +57,14 @@ class ContentWriterAgent(BaseAgent):
         # 用 `or` 而非 dict.get 默认值：配置里写了空串时也要回落，
         # 否则会把一个空的「内容风格要求」段落塞进 prompt。
         self.style = self.content_config.get("style") or "专业但通俗易懂"
+        self.image_count = int(self.content_config.get("image_count") or _DEFAULT_IMAGE_COUNT)
 
     def run(self, state: ArticleState) -> dict:
-        """执行内容创作"""
+        """执行内容创作
+
+        首次成文走 7 阶段精细化流水线；审核不通过的重写沿用既有重写契约，
+        不重跑全链路（避免每次重试都放大 7 倍调用）。
+        """
         topic = state.get("topic", "")
         outline = state.get("outline", "")
         target_audience = state.get("target_audience", "")
@@ -38,40 +74,187 @@ class ContentWriterAgent(BaseAgent):
 
         # 检查是否为重写（审核不通过的情况）
         if retry_count > 0 and review_result:
-            feedback = review_result.get("feedback", "")
-            prompt = self._build_rewrite_prompt(
-                title=article_title,
+            return self._run_rewrite(
+                state=state,
                 topic=topic,
                 outline=outline,
                 target_audience=target_audience,
-                original_content=state.get("content", ""),
-                feedback=feedback,
+                article_title=article_title,
+                review_result=review_result,
                 retry_count=retry_count,
             )
-        else:
-            prompt = self._build_new_prompt(
-                title=article_title,
-                topic=topic,
-                outline=outline,
-                target_audience=target_audience,
-            )
 
-        # 调用 LLM
-        response = self.invoke(prompt)
+        return self._run_pipeline(
+            state=state,
+            topic=topic,
+            outline=outline,
+            target_audience=target_audience,
+            article_title=article_title,
+            retry_count=retry_count,
+        )
 
-        # 提取文章内容
-        content = self._extract_content(response)
+    # ── 首次成文：7 阶段精细化创作 ──────────────────────
+
+    def _run_pipeline(
+        self,
+        state: ArticleState,
+        topic: str,
+        outline: str,
+        target_audience: str,
+        article_title: str,
+        retry_count: int,
+    ) -> dict:
+        """串行执行 7 个创作阶段，并用新值覆盖 topic_planner 的弱值"""
+        metadata = state.get("metadata") or {}
+        # 用户显式指定标题（cmd_run --title）时不覆盖，只把候选留档参考。
+        # 取 metadata 中保存的用户原始输入，而非 state.article_title
+        # （后者可能已被 topic_planner 改写，例如被拼成「选题｜标题」）。
+        title_pinned = str(metadata.get("title_pinned") or "")
+
+        result = run_content_pipeline(
+            llm_router=self.llm_router,
+            config=self.config,
+            topic=topic,
+            audience_hint=target_audience,
+            style=self.style,
+            min_words=self.min_words,
+            max_words=self.max_words,
+            image_count=self.image_count,
+            title_pinned=title_pinned,
+            fallback={
+                "outline": outline,
+                "article_title": article_title,
+                "summary": state.get("summary", ""),
+                "cover_prompt": state.get("cover_prompt", ""),
+                "target_audience": target_audience,
+            },
+            content_fallback=self._draft_fallback,
+            on_stage=lambda name, idx: logger.info(
+                f"[content_writer] 创作阶段 {idx + 1}/7：{name}"
+            ),
+        )
+
+        degraded = result.get("degraded") or []
+        if degraded:
+            logger.warning(f"创作流水线降级阶段: {', '.join(degraded)}")
+
+        # metadata 走 schema 级归并（Annotated merge_metadata），只需返回新增字段
+        new_metadata = {
+            "content_created_at": datetime.now().isoformat(),
+            "retry_count": retry_count,
+            "topic_analysis": result["topic_analysis"],
+            "summary_detail": result["summary"],
+            "content_stage_timings_ms": result["stage_timings_ms"],
+        }
+        # 空值不落库，避免 metadata 被空列表/空串污染
+        for key, value in (
+            ("outline_sections", result.get("outline_sections")),
+            ("title_candidates", result.get("title_candidates")),
+            ("tags", result.get("tags")),
+            ("inline_prompts", result.get("inline_prompts")),
+            ("content_pipeline_degraded", degraded),
+        ):
+            if value:
+                new_metadata[key] = value
+
+        return {
+            "content": result["content"],
+            "article_title": result["title"] or article_title or topic,
+            "outline": result["outline"] or outline,
+            "target_audience": result["target_audience"] or target_audience,
+            "summary": result["summary_text"] or state.get("summary", ""),
+            "cover_prompt": result["cover_prompt"] or state.get("cover_prompt", ""),
+            "metadata": new_metadata,
+        }
+
+    def _draft_fallback(
+        self,
+        *,
+        title: str,
+        outline: str,
+        target_audience: str,
+        topic: str,
+    ) -> str:
+        """正文阶段失败时的兜底：复用改造前的单次成文路径（_build_new_prompt）"""
+        prompt = self._build_new_prompt(
+            title=title,
+            topic=topic,
+            outline=outline,
+            target_audience=target_audience,
+        )
+        return self._extract_content(self.invoke(prompt))
+
+    # ── 重写路径：沿用既有契约，仅刷新摘要与标签 ──────────
+
+    def _run_rewrite(
+        self,
+        state: ArticleState,
+        topic: str,
+        outline: str,
+        target_audience: str,
+        article_title: str,
+        review_result: dict,
+        retry_count: int,
+    ) -> dict:
+        """审核不通过后的重写
+
+        沿用改造前的重写契约（1 次 LLM），不重跑主题分析/大纲/标题/配图；
+        仅基于重写后的正文刷新摘要与标签（非关键，失败保留旧值）。
+        """
+        feedback = review_result.get("feedback", "")
+        prompt = self._build_rewrite_prompt(
+            title=article_title,
+            topic=topic,
+            outline=outline,
+            target_audience=target_audience,
+            original_content=state.get("content", ""),
+            feedback=feedback,
+            retry_count=retry_count,
+        )
+        content = self._extract_content(self.invoke(prompt))
+
+        new_metadata = {
+            "content_created_at": datetime.now().isoformat(),
+            "retry_count": retry_count,
+        }
+
+        if content.strip():
+            self._refresh_summary_and_tags(content, article_title, new_metadata)
 
         return {
             "content": content,
             "article_title": article_title or topic,
-            "summary": state.get("summary", ""),
-            # metadata 走 schema 级归并（Annotated merge_metadata），只需返回新增字段
-            "metadata": {
-                "content_created_at": datetime.now().isoformat(),
-                "retry_count": retry_count,
-            },
+            "summary": new_metadata.pop("summary_text", state.get("summary", "")),
+            "metadata": new_metadata,
         }
+
+    def _refresh_summary_and_tags(
+        self, content: str, article_title: str, new_metadata: dict
+    ) -> None:
+        """基于重写后的正文刷新摘要与标签（失败静默保留旧值）"""
+        try:
+            router = FallbackLLMRouter(self.llm_router)
+            summary = SummaryExtractorAgent(router, self.config).generate(
+                title=article_title, content=content
+            )
+            if summary:
+                new_metadata["summary_detail"] = summary
+                summary_text = summary_to_text(summary)
+                if summary_text:
+                    new_metadata["summary_text"] = summary_text
+
+            tags = (
+                TagExtractorAgent(router, self.config).generate(
+                    title=article_title, content=content, analysis={}
+                )
+                or {}
+            ).get("tags") or []
+            if tags:
+                new_metadata["tags"] = tags
+        except Exception as e:
+            logger.warning(f"重写后刷新摘要/标签失败，保留原有值: {e}")
+
+    # ── prompt 构建（既有契约，测试直接断言，勿改结构）────
 
     def _build_new_prompt(
         self,

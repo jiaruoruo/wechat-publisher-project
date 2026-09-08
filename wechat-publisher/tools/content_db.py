@@ -103,6 +103,56 @@ class ContentDB:
                 FOREIGN KEY (article_id) REFERENCES articles(id)
             )
         """)
+        # ── 运营增长能力（选题库 / 竞品模式 / 表现归因）──
+        # 全部 CREATE TABLE IF NOT EXISTS：对历史库零破坏，首次运行自动建表。
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS competitor_titles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                source TEXT,
+                keyword TEXT,
+                url TEXT,
+                collected_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS title_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                pattern_type TEXT NOT NULL,   -- numeric/question/contrast/list/urgency
+                pattern TEXT NOT NULL,
+                hit_count INTEGER DEFAULT 0,
+                sample TEXT,
+                collected_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS article_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_id INTEGER,
+                title TEXT,
+                publish_url TEXT,
+                read_count INTEGER DEFAULT 0,
+                share_count INTEGER DEFAULT 0,
+                like_count INTEGER DEFAULT 0,
+                collected_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS topic_bank (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                angle TEXT,
+                why TEXT,
+                direction TEXT,
+                score REAL DEFAULT 0,
+                score_detail TEXT,
+                pattern TEXT,
+                evidence TEXT,
+                confidence TEXT,
+                used INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            )
+        """)
         conn.commit()
         logger.info(f"数据库初始化完成: {self.db_path}")
 
@@ -276,3 +326,188 @@ class ContentDB:
             "SELECT COUNT(*) FROM articles WHERE created_at >= ?",
             (cutoff_iso,),
         ).fetchone()[0]
+
+    # ── 运营增长：竞品标题 ───────────────────────────────
+    def save_competitor_titles(self, rows: list[dict]) -> int:
+        """批量写入竞品标题（调用方已去重）。返回写入条数。
+
+        rows: [{"title","source","keyword","url"}]
+        """
+        if not rows:
+            return 0
+        now = datetime.now().isoformat()
+        conn = self._get_conn()
+        inserted = 0
+        for r in rows:
+            title = (r.get("title") or "").strip()
+            if not title:
+                continue
+            conn.execute(
+                "INSERT INTO competitor_titles (title, source, keyword, url, collected_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    title[:500],
+                    str(r.get("source") or "")[:120],
+                    str(r.get("keyword") or "")[:120],
+                    str(r.get("url") or "")[:500],
+                    now,
+                ),
+            )
+            inserted += 1
+        conn.commit()
+        logger.info(f"竞品标题已入库: {inserted} 条")
+        return inserted
+
+    def get_competitor_titles(self, limit: int = 200) -> list[dict]:
+        """读取竞品标题池（按采集时间倒序）"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT title, source, keyword, url, collected_at "
+            "FROM competitor_titles ORDER BY collected_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── 运营增长：标题模式库 ─────────────────────────────
+    def save_title_patterns(self, rows: list[dict]) -> int:
+        """批量写入标题模式库（调用方已做类型唯一去重）。返回写入条数。
+
+        rows: [{"pattern_type","pattern","hit_count","sample"}]
+        """
+        if not rows:
+            return 0
+        now = datetime.now().isoformat()
+        conn = self._get_conn()
+        inserted = 0
+        for r in rows:
+            ptype = str(r.get("pattern_type") or "").strip()
+            pattern = str(r.get("pattern") or "").strip()
+            if not ptype or not pattern:
+                continue
+            conn.execute(
+                "INSERT INTO title_patterns "
+                "(pattern_type, pattern, hit_count, sample, collected_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    ptype[:40],
+                    pattern[:120],
+                    int(r.get("hit_count") or 0),
+                    str(r.get("sample") or "")[:300],
+                    now,
+                ),
+            )
+            inserted += 1
+        conn.commit()
+        logger.info(f"标题模式已入库: {inserted} 条")
+        return inserted
+
+    def get_title_patterns(self, limit: int = 200) -> list[dict]:
+        """读取标题模式库（按命中次数倒序），供选题评分器使用"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT pattern_type, pattern, hit_count, sample "
+            "FROM title_patterns ORDER BY hit_count DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── 运营增长：自有文章表现 ───────────────────────────
+    def save_article_metrics(self, rows: list[dict]) -> int:
+        """批量写入自有文章表现数据（阅读/分享/点赞）。返回写入条数。
+
+        rows: [{"article_id","title","publish_url","read_count",
+                "share_count","like_count"}]
+        """
+        if not rows:
+            return 0
+        now = datetime.now().isoformat()
+        conn = self._get_conn()
+        inserted = 0
+        for r in rows:
+            title = (r.get("title") or "").strip()
+            if not title and not r.get("publish_url"):
+                continue
+            conn.execute(
+                "INSERT INTO article_metrics "
+                "(article_id, title, publish_url, read_count, share_count, "
+                "like_count, collected_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    r.get("article_id"),
+                    title[:500],
+                    str(r.get("publish_url") or "")[:500],
+                    int(r.get("read_count") or 0),
+                    int(r.get("share_count") or 0),
+                    int(r.get("like_count") or 0),
+                    now,
+                ),
+            )
+            inserted += 1
+        conn.commit()
+        logger.info(f"自有文章表现数据已入库: {inserted} 条")
+        return inserted
+
+    def get_article_metrics(self, limit: int = 500) -> list[dict]:
+        """读取自有文章表现数据（按采集时间倒序）"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT title, publish_url, read_count, share_count, like_count, "
+            "collected_at FROM article_metrics ORDER BY collected_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ── 运营增长：选题库 ─────────────────────────────────
+    def save_topic_bank(self, rows: list[dict]) -> int:
+        """批量写入评分后的候选选题库。返回写入条数。
+
+        rows: [{"title","angle","why","direction","score","score_detail",
+                "pattern","evidence","confidence"}]
+        """
+        if not rows:
+            return 0
+        now = datetime.now().isoformat()
+        conn = self._get_conn()
+        inserted = 0
+        for r in rows:
+            title = (r.get("title") or "").strip()
+            if not title:
+                continue
+            conn.execute(
+                "INSERT INTO topic_bank "
+                "(title, angle, why, direction, score, score_detail, pattern, "
+                "evidence, confidence, used, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
+                (
+                    title[:300],
+                    str(r.get("angle") or "")[:500],
+                    str(r.get("why") or "")[:500],
+                    str(r.get("direction") or "")[:40],
+                    float(r.get("score") or 0.0),
+                    json.dumps(r.get("score_detail") or {}, ensure_ascii=False)[:1000],
+                    str(r.get("pattern") or "")[:200],
+                    str(r.get("evidence") or "")[:500],
+                    str(r.get("confidence") or "medium")[:20],
+                    now,
+                ),
+            )
+            inserted += 1
+        conn.commit()
+        logger.info(f"选题库已入库: {inserted} 条")
+        return inserted
+
+    def get_top_topics(self, limit: int = 10) -> list[dict]:
+        """按评分降序取选题库 Top N（扫描未使用优先，再按分数）"""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT id, title, angle, direction, score, pattern, evidence, "
+            "confidence, created_at FROM topic_bank "
+            "ORDER BY used ASC, score DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def mark_topic_used(self, topic_id: int) -> None:
+        """标记某选题已被采用（used=1），避免重复推荐"""
+        conn = self._get_conn()
+        conn.execute("UPDATE topic_bank SET used=1 WHERE id=?", (topic_id,))
+        conn.commit()

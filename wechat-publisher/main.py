@@ -2,6 +2,7 @@
 
 import os
 import sys
+import json
 import argparse
 import logging
 
@@ -12,8 +13,10 @@ if BASE_DIR not in sys.path:
 
 from models.llm_router import load_config, LLMRouter
 from graph.workflow import ArticleWorkflow
-from agents.topic_planner import TopicPlannerAgent
+from agents.topic_planner import TopicPlannerAgent, resolve_planning_config
+from agents.content.pipeline import run_content_pipeline
 from browser.wechat_session import WechatSession
+from tools import competitor_feed, metrics_feed
 from browser.screenshot_utils import cleanup_old_screenshots
 from browser.wechat_selectors import validate_selectors_config
 from browser.selector_ledger import cleanup_old_stats
@@ -44,6 +47,10 @@ def cmd_run(args):
         initial_state["topic"] = args.topic
     if args.title:
         initial_state["article_title"] = args.title
+        # 显式指定标题时把原始输入存入 metadata：content_writer 的标题创作阶段
+        # 只出候选、不覆盖，避免用户意图被七阶段重生成的新标题冲掉
+        # （存原始值而非 True，是为了绕开 topic_planner 可能的改写）。
+        initial_state["metadata"] = {"title_pinned": args.title}
 
     result = workflow.run(initial_state if initial_state else None)
 
@@ -61,7 +68,7 @@ def cmd_topics(args):
     router = LLMRouter(config)
     agent = TopicPlannerAgent(router, config)
 
-    count = getattr(args, "count", 12) or 12
+    count = getattr(args, "count", 15) or 15
     topics = agent.suggest_topics(count=count)
 
     if not topics:
@@ -85,6 +92,204 @@ def cmd_topics(args):
         if evidence:
             print(f"   依据: {evidence}")
     print("\n请回复编号选择，或给出你自己的选题（用 run --topic 执行，当前为 draft 模式不群发）。")
+
+
+def cmd_research(args):
+    """采集竞品爆款标题 + 自有表现，提炼模式库，构建数据化选题库（research）"""
+    config = load_config()
+    db_path = config.get("storage", {}).get("db_path")
+    content = config.get("content", {})
+    planning = resolve_planning_config(content)
+    keywords = planning.get("competitor_keywords") or content.get("keywords", [])
+
+    if not keywords:
+        print("[WARNING] 未配置竞品采集关键词（content.keywords 与 topic_planning.competitor_keywords 均为空），跳过竞品采集。")
+        return
+
+    with ContentDB(db_path) as db:
+        # 1) 竞品/热门标题 + 模式库
+        titles, patterns = competitor_feed.build_competitor_bank(
+            db,
+            keywords,
+            max_keywords=planning.get("competitor_max_keywords", 3),
+            results_per_keyword=planning.get("competitor_results_per_keyword", 5),
+        )
+        print(f"\n[采集] 竞品/热门标题 {len(titles)} 条，提炼标题模式 {len(patterns)} 类")
+        for p in patterns[:12]:
+            print(f"  - [{p.get('pattern_type')}] {p.get('pattern')} (命中 {p.get('hit_count')})")
+
+        # 2) 自有文章表现（需登录会话；失败则尝试 CSV 补录）
+        metrics = []
+        csv_path = getattr(args, "metrics_csv", None)
+        if csv_path:
+            metrics = metrics_feed.import_metrics_from_csv(csv_path)
+        else:
+            try:
+                session = WechatSession(config)
+                session.start()
+                if session.check_login():
+                    metrics = metrics_feed.collect_metrics(session, config)
+                else:
+                    print("[WARNING] 公众号未登录或会话失效，跳过自有表现采集（可用 --metrics-csv 手动补录）")
+                session.close()
+            except Exception as e:  # noqa: BLE001
+                print(f"[WARNING] 表现采集失败（已降级）: {e}")
+
+        if metrics:
+            db.save_article_metrics(metrics)
+
+        # 3) 爆款归因（即时预览）
+        report = metrics_feed.attribute_performance(metrics, patterns)
+        print(f"\n[归因] 自有表现样本 {len(metrics)} 条")
+        if not report:
+            print("  样本不足或暂无数据，暂无法归因（多运行并积累表现数据后可复盘）。")
+        else:
+            for r in report[:10]:
+                print(f"  - {r['segment']}: 均阅读 {r['avg_read']} / 均分享 {r['avg_share']} / 均点赞 {r['avg_like']} (n={r['count']})")
+
+    print("\n数据已沉淀到选题库与模式库（DB）。运行 `python main.py topics` 即可获得带评分的候选选题。")
+
+
+def cmd_report(args):
+    """输出爆款归因报告（基于已沉淀的 DB 数据，report）"""
+    config = load_config()
+    db_path = config.get("storage", {}).get("db_path")
+
+    with ContentDB(db_path) as db:
+        metrics = db.get_article_metrics()
+        patterns = db.get_title_patterns()
+        titles = db.get_competitor_titles(limit=10)
+
+    print("\n=== 爆款归因报告 ===")
+    print(f"自有表现样本: {len(metrics)} 条 | 竞品模式库: {len(patterns)} 类 | 竞品标题池: {len(titles)} 条")
+
+    if not metrics:
+        print("暂无自有表现数据：请先运行 `python main.py research`（或 research --metrics-csv 补录）采集阅读/分享/点赞。")
+        return
+
+    report = metrics_feed.attribute_performance(metrics, patterns)
+    if not report:
+        print("样本不足，无法归因。")
+        return
+
+    print("\n按平均阅读降序的归因：")
+    for r in report:
+        print(f"  - {r['segment']}: 均阅读 {r['avg_read']} | 均分享 {r['avg_share']} | 均点赞 {r['avg_like']} | n={r['count']}")
+
+    if len(metrics) < 3:
+        print("\n[提示] 样本量偏小（<3），归因结论仅供参考；随发布积累可逐步提权 history 维度。")
+
+
+def _compose_markdown(result: dict) -> str:
+    """把创作结果拼成可落盘的 Markdown（标题 + 摘要 + 标签 + 封面提示词 + 正文）"""
+    lines = [f"# {result.get('title', '')}", ""]
+
+    summary = result.get("summary") or {}
+    if summary.get("one_liner"):
+        lines += [f"> {summary['one_liner']}", ""]
+
+    tags = result.get("tags") or []
+    if tags:
+        lines += [f"标签：{' / '.join(tags)}", ""]
+
+    if result.get("cover_prompt"):
+        lines += [f"封面提示词：{result['cover_prompt']}", ""]
+
+    lines += [result.get("content", ""), ""]
+    return "\n".join(lines)
+
+
+def _print_compose_result(result: dict):
+    """以人读友好的方式打印 7 阶段创作结果"""
+    print(f"\n=== 标题 ===\n{result.get('title', '')}")
+
+    candidates = result.get("title_candidates") or []
+    if candidates:
+        print("\n候选标题：")
+        for i, c in enumerate(candidates, 1):
+            style = c.get("style") or ""
+            suffix = f"  [{style}]" if style else ""
+            print(f"  {i}. {c.get('title', '')}{suffix}")
+
+    analysis = result.get("topic_analysis") or {}
+    if analysis.get("target_audience"):
+        print(f"\n=== 目标受众 ===\n{analysis['target_audience']}")
+    if analysis.get("angle"):
+        print(f"\n切入角度：{analysis['angle']}")
+    if analysis.get("key_points"):
+        print("\n必覆盖要点：")
+        for p in analysis["key_points"]:
+            print(f"  - {p}")
+
+    print(f"\n=== 大纲 ===\n{result.get('outline', '')}")
+
+    summary = result.get("summary") or {}
+    if summary.get("one_liner"):
+        print(f"\n=== 摘要 ===\n{summary['one_liner']}")
+    if summary.get("key_points"):
+        print("\n核心要点：")
+        for p in summary["key_points"]:
+            print(f"  - {p}")
+    if summary.get("gist"):
+        print(f"\n精华段：\n{summary['gist']}")
+
+    tags = result.get("tags") or []
+    if tags:
+        print(f"\n=== 标签 ===\n{' / '.join(tags)}")
+
+    print(f"\n=== 封面提示词 ===\n{result.get('cover_prompt', '')}")
+    inline = result.get("inline_prompts") or []
+    if inline:
+        print("\n插图提示词：")
+        for i, p in enumerate(inline, 1):
+            print(f"  {i}. {p}")
+
+    content = result.get("content") or ""
+    print(f"\n=== 正文（{len(content)} 字）===\n{content}")
+
+
+def cmd_compose(args):
+    """按指定主题单独跑 7 个创作阶段（不发布、不落库）
+
+    主题通常来自 `topics` 命令给出的候选范围，由人工指定后传入本命令。
+    """
+    config = load_config()
+    content_config = config.get("content") or {}
+    length = content_config.get("article_length") or {}
+
+    router = LLMRouter(config)
+
+    print("\n=== 内容创作七阶段 ===")
+    print(f"主题: {args.topic}")
+
+    result = run_content_pipeline(
+        llm_router=router,
+        config=config,
+        topic=args.topic,
+        audience_hint=args.audience or "",
+        style=content_config.get("style") or "",
+        min_words=args.words_min or int(length.get("min") or 1500),
+        max_words=args.words_max or int(length.get("max") or 3000),
+        image_count=args.image_count,
+        on_stage=lambda name, idx: print(f"  [{idx + 1}/7] {name} ...", flush=True),
+    )
+
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        _print_compose_result(result)
+
+    if getattr(args, "out", None):
+        try:
+            with open(args.out, "w", encoding="utf-8") as f:
+                f.write(_compose_markdown(result))
+            print(f"\n已写入: {args.out}")
+        except Exception as e:
+            print(f"\n写入文件失败: {e}")
+
+    degraded = result.get("degraded") or []
+    if degraded:
+        print(f"\n[提示] 以下阶段发生降级（已回落兜底值）: {', '.join(degraded)}")
 
 
 def cmd_login(args):
@@ -261,6 +466,7 @@ def main():
 使用示例:
   python main.py run                    # 立即执行一次完整工作流
   python main.py run --topic "AI趋势"   # 指定选题执行
+  python main.py compose --topic "AI趋势" # 按指定主题跑创作七阶段（不发布）
   python main.py --run-now              # 立即执行（快捷方式）
   python main.py login                  # 交互式登录公众号
   python main.py schedule               # 启动定时调度
@@ -284,7 +490,32 @@ def main():
 
     # topics 命令（候选选题清单，只读不发布）
     topics_parser = subparsers.add_parser("topics", help="产出候选选题清单供审核（不写库、不发布）")
-    topics_parser.add_argument("--count", type=int, default=12, help="候选数量（默认 12，实际 10~15）")
+    topics_parser.add_argument("--count", type=int, default=15, help="候选数量（默认 15，实际 13~17）")
+
+    # research 命令（运营增长：竞品模式 + 表现采集，构建数据化选题库）
+    research_parser = subparsers.add_parser(
+        "research", help="采集竞品爆款标题与自有表现，提炼模式库、构建选题库"
+    )
+    research_parser.add_argument(
+        "--metrics-csv", type=str, default=None,
+        help="手动补录自有表现数据的 CSV（列：title,publish_url,read_count,share_count,like_count），"
+             "用于后台选择器失效时兜底，不触发浏览器抓取",
+    )
+
+    # report 命令（爆款归因报告）
+    subparsers.add_parser("report", help="输出爆款归因报告（基于已沉淀的 DB 数据）")
+
+    # compose 命令（内容创作七阶段：主题分析→大纲→标题→正文→摘要→标签→图像提示词）
+    compose_parser = subparsers.add_parser(
+        "compose", help="按指定主题跑内容创作七阶段（不发布、不落库）"
+    )
+    compose_parser.add_argument("--topic", type=str, required=True, help="创作主题（可从 topics 命令的候选里人工指定）")
+    compose_parser.add_argument("--audience", type=str, default="", help="目标受众提示（可选）")
+    compose_parser.add_argument("--words-min", type=int, default=0, help="正文最小字数（默认取配置）")
+    compose_parser.add_argument("--words-max", type=int, default=0, help="正文最大字数（默认取配置）")
+    compose_parser.add_argument("--image-count", type=int, default=3, help="期望插图数量（默认 3）")
+    compose_parser.add_argument("--out", type=str, default=None, help="将结果写入 Markdown 文件")
+    compose_parser.add_argument("--json", action="store_true", help="以 JSON 输出完整结果（便于程序消费）")
 
     # login 命令
     login_parser = subparsers.add_parser("login", help="交互式登录公众号")
@@ -318,6 +549,9 @@ def main():
     commands = {
         "run": cmd_run,
         "topics": cmd_topics,
+        "research": cmd_research,
+        "report": cmd_report,
+        "compose": cmd_compose,
         "login": cmd_login,
         "schedule": cmd_schedule,
         "check": cmd_check,
